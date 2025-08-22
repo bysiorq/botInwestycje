@@ -1,11 +1,4 @@
-# ────────────────────────── etapy_bot.py (2025-08 • Storage: SQLite, stable sticky UI) ──────────────────────────
-# Single-message UI jak BotFather. Stabilne na webhooku:
-# • Trwały stan per user w /data/state/<uid>.json (date, project, stage_code, await, sticky_id)
-# • Dane biznesowe w SQLite: /data/invest.db (projects, stages)
-# • Callbacki niosą stage_code (S1..S7) → brak zależności od ulotnego user_data
-# • Każda zmiana zapisuje do DB i od razu renderuje widok. Bez duplikowania wiadomości.
-# • Zdjęcia: przechowujemy telegramowe file_id rozdzielone spacją (max ~200/sesję)
-
+# ────────────────────────── etapy_bot.py (2025-08 • SQLite + solidny sticky panel) ──────────────────────────
 import os
 import re
 import json
@@ -30,7 +23,7 @@ from telegram.error import BadRequest
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
-if WEBHOOK_URL and not WEBHOOK_URL.startswith("http"):
+if WEBHOOK_URL and not WEBHOOK_URL.startswith(("http://", "https://")):
     WEBHOOK_URL = "https://" + WEBHOOK_URL
 PORT = int(os.getenv("PORT", 8080))
 DATA_DIR = os.getenv("DATA_DIR", ".")
@@ -121,12 +114,12 @@ def init_db():
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
         code TEXT NOT NULL,
         name TEXT NOT NULL,
-        percent INTEGER,            -- NULL → brak
-        to_finish TEXT,             -- "Do dokończenia"
-        notes TEXT,                 -- "Notatki"
-        finished TEXT,              -- "-" / "✓" (opcjonalnie)
+        percent INTEGER,
+        to_finish TEXT,
+        notes TEXT,
+        finished TEXT,
         last_updated TEXT,
-        photos TEXT,                -- "fileid fileid ..."
+        photos TEXT,
         last_editor TEXT,
         last_editor_id TEXT,
         UNIQUE(project_id, code)
@@ -160,7 +153,6 @@ def _get_project_id(name: str) -> Optional[int]:
     return row["id"] if row else None
 
 def _ensure_default_stages(pid: int):
-    # Dodaj S1..S7 jeśli brak
     conn = _conn(); cur = conn.cursor()
     cur.execute("SELECT code FROM stages WHERE project_id=?;", (pid,))
     have = {r["code"] for r in cur.fetchall()}
@@ -174,17 +166,13 @@ def _ensure_default_stages(pid: int):
 
 def add_project(name: str) -> None:
     name = name.strip()
-    if not name:
-        return
-    pid = _get_project_id(name)
-    if pid:
-        return
+    if not name: return
+    if _get_project_id(name): return
     conn = _conn(); cur = conn.cursor()
     cur.execute("INSERT INTO projects(name, active, finished, created_at) VALUES(?, 1, 0, ?);", (name, datetime.now().isoformat()))
     conn.commit(); conn.close()
     pid = _get_project_id(name)
-    if pid:
-        _ensure_default_stages(pid)
+    if pid: _ensure_default_stages(pid)
 
 def set_project_active(name: str, active: bool) -> None:
     conn = _conn(); cur = conn.cursor()
@@ -206,7 +194,6 @@ def read_stage(project: str, stage_name: str) -> Dict[str, str]:
     cur.execute("SELECT * FROM stages WHERE project_id=? AND name=?;", (pid, stage_name))
     r = cur.fetchone()
     if not r:
-        # fallback – utwórz brakujący etap po nazwie
         code = NAME2CODE.get(stage_name, "S?")
         cur.execute("""
             INSERT INTO stages (project_id, code, name, percent, to_finish, notes, finished, last_updated, photos, last_editor, last_editor_id)
@@ -231,28 +218,16 @@ def read_stage(project: str, stage_name: str) -> Dict[str, str]:
 def update_stage(project: str, stage_name: str, updates: Dict[str, str], editor_name: str, editor_id: int) -> None:
     pid = _get_project_id(project)
     if not pid:
-        add_project(project)
-        pid = _get_project_id(project)
+        add_project(project); pid = _get_project_id(project)
     _ensure_default_stages(pid)
-    # mapowanie kolumn
     colmap = {
-        "Percent": "percent",
-        "ToFinish": "to_finish",
-        "Notes": "notes",
-        "Finished": "finished",
-        "LastUpdated": "last_updated",
-        "Photos": "photos",
-        "LastEditor": "last_editor",
-        "LastEditorId": "last_editor_id",
+        "Percent": "percent", "ToFinish": "to_finish", "Notes": "notes", "Finished": "finished",
+        "LastUpdated": "last_updated", "Photos": "photos", "LastEditor": "last_editor", "LastEditorId": "last_editor_id",
     }
-    sets = []
-    vals = []
+    sets, vals = [], []
     for k, v in updates.items():
-        if k not in colmap:
-            raise ValueError(f"Unsupported field: {k}")
-        sets.append(f"{colmap[k]}=?")
-        vals.append(v)
-    # meta
+        if k not in colmap: raise ValueError(f"Unsupported field: {k}")
+        sets.append(f"{colmap[k]}=?"); vals.append(v)
     sets.extend(["last_updated=?", "last_editor=?", "last_editor_id=?"])
     vals.extend([datetime.now().strftime("%d.%m.%Y %H:%M:%S"), editor_name or "", str(editor_id or "")])
     vals.extend([pid, stage_name])
@@ -260,7 +235,6 @@ def update_stage(project: str, stage_name: str, updates: Dict[str, str], editor_
     conn = _conn(); cur = conn.cursor()
     cur.execute(sql, tuple(vals))
     if cur.rowcount == 0:
-        # jeśli brak – wstaw
         code = NAME2CODE.get(stage_name, "S?")
         fields = {"percent": None, "to_finish": "", "notes": "", "finished": "-",
                   "last_updated": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
@@ -276,16 +250,12 @@ def update_stage(project: str, stage_name: str, updates: Dict[str, str], editor_
 
 def _percent_preview_for_project(project: str) -> str:
     pid = _get_project_id(project)
-    if not pid:
-        return "-"
+    if not pid: return "-"
     conn = _conn(); cur = conn.cursor()
-    cur.execute("SELECT code, name, percent FROM stages WHERE project_id=?;", (pid,))
-    rows = {r["name"]: ( "-" if r["percent"] is None else (f"{int(r['percent'])}%" if str(r["percent"]).isdigit() else str(r["percent"])) ) for r in cur.fetchall()}
+    cur.execute("SELECT name, percent FROM stages WHERE project_id=?;", (pid,))
+    rows = {r["name"]: ("-" if r["percent"] is None else (f"{int(r['percent'])}%" if str(r["percent"]).isdigit() else str(r["percent"]))) for r in cur.fetchall()}
     conn.close()
-    parts = []
-    for st in STAGES:
-        parts.append(f"{st['name'].split()[-1]} {rows.get(st['name'], '-')}")
-    return " | ".join(parts)
+    return " | ".join(f"{st['name'].split()[-1]} {rows.get(st['name'], '-')}" for st in STAGES)
 
 # ──────────────────── UI helpers ────────────────────
 async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
@@ -298,39 +268,37 @@ async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
         pass
 
 async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
-    """Edytuje istniejący panel; nową wiadomość wysyła tylko jeśli edycja jest niemożliwa."""
+    """Edytuje istniejący panel; gdy edycja nie przejdzie – wysyła nowy i zapamiętuje sticky_id."""
     chat = update_or_ctx.effective_chat if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.message.chat
     chat_id = chat.id
     sticky_id = context.user_data.get("sticky_id")
+    can_send_new = True
     if sticky_id:
         try:
             await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=sticky_id, text=text,
-                reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True
+                chat_id=chat_id,
+                message_id=sticky_id,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
             )
             return
         except BadRequest as e:
-            msg = str(e).lower()
-            if "message is not modified" in msg:
+            emsg = str(e)
+            logging.info(f"editMessageText failed: {emsg}")
+            if "message is not modified" in emsg.lower():
                 return
-            if not any(s in msg for s in [
-                "message to edit not found",
-                "message identifier is not specified",
-                "chat not found",
-                "message can't be edited",
-            ]):
-                # inny błąd – nie próbuj wysyłać nowego
-                return
-        except Exception:
-            return
-    m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
-    context.user_data["sticky_id"] = m.message_id
-    try:
+            # na każdy inny BadRequest – spróbuj wysłać nową
+            can_send_new = True
+        except Exception as e:
+            logging.info(f"editMessageText exception: {e}")
+            can_send_new = True
+    if can_send_new:
+        m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
+        context.user_data["sticky_id"] = m.message_id
         uid = (update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update)
                else update_or_ctx.callback_query.from_user.id)
         sync_out(uid, context)
-    except Exception:
-        pass
 
 def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
     aw = context.user_data.get("await") or {}
@@ -340,14 +308,14 @@ def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
     scode = context.user_data.get("stage_code") or ""
     sname = CODE2NAME.get(scode, "")
     where = f" (inwestycja: {proj}" + (f" | {sname}" if sname else "") + ")"
-    return f"✍️ *Oczekuję na:* {names.get(aw.get('field'), aw.get('field'))}{where}. Wyślij teraz.\n"
+    return f"✍️ Oczekuję na: {names.get(aw.get('field'), aw.get('field'))}{where}. Wyślij teraz.\n"
 
 def projects_menu_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     ds = context.user_data.get("date", today_str())
     out = []
     b = banner_await(context); 
     if b: out.append(b)
-    out.append(f"🏗️ *Inwestycje*  |  📅 {ds}\n")
+    out.append(f"🏗️ Inwestycje  |  📅 {ds}\n")
     if not list_projects(active_only=True):
         out.append("Brak inwestycji. Dodaj pierwszą 👇")
     return "\n".join(out)
@@ -370,7 +338,7 @@ def project_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     out = []
     b = banner_await(context)
     if b: out.append(b)
-    out.append(f"🏗️ *{proj}*")
+    out.append(f"🏗️ {proj}")
     out.append(f"📊 Postęp etapów: {_percent_preview_for_project(proj)}\n")
     out.append("👇 Wybierz etap. Otwarte zadania:")
     for st in STAGES:
@@ -407,7 +375,7 @@ def stage_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     b = banner_await(context)
     if b: out.append(b)
     out.extend([
-        f"🏗️ *{proj}*  →  {sname}",
+        f"🏗️ {proj}  →  {sname}",
         "",
         f"📊 % ukończenia: {data['Percent'] if data['Percent'] != '' else '-'}",
         f"🔧 Do dokończenia:\n{data['ToFinish'] or '-'}",
@@ -431,7 +399,7 @@ def stage_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(mark("🔧 Do dokończenia", "todo"), callback_data="stage:set:todo"),
          InlineKeyboardButton(mark("📝 Notatki", "notes"), callback_data="stage:set:notes")],
         [InlineKeyboardButton(mark("📊 % (0/25/50/75/90/100)", "percent"), callback_data=f"stage:set:percent:{scode}"),
-        InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
+         InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
         [InlineKeyboardButton("🧹 Wyczyść Do dokończenia", callback_data=f"stage:clear:todo:{scode}"),
          InlineKeyboardButton("🧹 Wyczyść Notatki", callback_data=f"stage:clear:notes:{scode}")],
         [InlineKeyboardButton("💾 Zapisz zmiany", callback_data=f"stage:save:{scode}")],
@@ -490,11 +458,9 @@ async def render_stage(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────── Handlers ────────────────────
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = sync_in(update, context)
-    # NIE czyścimy sticky_id
-    sticky_id = context.user_data.get("sticky_id")
+    sid = context.user_data.get("sticky_id")
     context.user_data.clear()
-    if sticky_id:
-        context.user_data["sticky_id"] = sticky_id
+    if sid: context.user_data["sticky_id"] = sid
     context.user_data["date"] = today_str()
     sync_out(uid, context)
     await render_home(update, context)
@@ -502,9 +468,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = sync_in(update, context); sync_out(uid, context)
     text = (
-        "🤖 *Pomoc – Inwestycje*\n"
+        "🤖 Pomoc – Inwestycje\n"
         "• /start – lista inwestycji, dodawanie, archiwum.\n"
-        "• W projekcie → Etap → edytuj pola. Zmiany zapisują się do *SQLite* i od razu widać je w panelu.\n"
+        "• W projekcie → Etap → edytuj pola. Zmiany zapisują się do SQLite i od razu je widać w panelu.\n"
         "• Kropki ○/● pokazują, że czekam na tekst/zdjęcie.\n"
         "• Stan sesji (w tym sticky_id) jest trwały.\n"
     )
@@ -550,16 +516,15 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_home(update, context); return
 
     if data == "proj:arch":
-        await sticky_set(update, context, "🗄 *Archiwum / Aktywne* (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
+        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
 
     if data.startswith("arch:tog:"):
         idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
         if 0 <= idx < len(names):
-            # toggle active
             allp = {p["name"]: p for p in list_projects(active_only=False)}
             cur = allp.get(names[idx])
             if cur: set_project_active(names[idx], not cur["active"])
-        await sticky_set(update, context, "🗄 *Archiwum / Aktywne* (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
+        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
 
     if data.startswith("proj:open:"):
         idx = int(data.split(":")[2]); projs = list_projects(active_only=True)
@@ -574,7 +539,7 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proj = context.user_data.get("project")
         if not proj: sync_out(uid, context); await render_home(update, context); return
         set_project_finished(proj, True)
-        await sticky_set(update, context, f"🎉 *{proj}* oznaczono jako zakończoną. 💪", InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wróć", callback_data="nav:home")]]))
+        await sticky_set(update, context, f"🎉 {proj} oznaczono jako zakończoną. 💪", InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wróć", callback_data="nav:home")]]))
         sync_out(uid, context); return
 
     if data == "proj:toggle_active":
