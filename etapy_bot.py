@@ -1,18 +1,19 @@
 # ────────────────────────── etapy_bot.py (2025-08) ──────────────────────────
-# Bot do prowadzenia etapów inwestycji (elektryka / automatyka smart dom)
-# - /start pokazuje listę inwestycji (z możliwością dodania nowej) + wybór daty
-# - Wejście w inwestycję → kafelki: Etap 1..6, Prace dodatkowe (7), Czy skończone? (8)
-# - Wejście w Etap → kafelki: "Jakie prace należy dokończyć?", "Na ile %", "💾 Zapisz"
-# - Edycja dzisiejszych wpisów dla inwestycji (jak w raporcie dziennym)
-# - Excel z blokadą, backupami, miesięczne arkusze, opcjonalny upload do SharePoint
-# - Eksport całego miesiąca (admin) i użytkownika
+# Panel jak BotFather (jedna wiadomość), zarządzanie etapami inwestycji.
+# • /start → lista inwestycji (wspólna dla zespołu) + dodanie nowej
+# • Każda inwestycja ma stałe etapy: Etap 1..Etap 6, Prace dodatkowe
+# • W etapie: "Do dokończenia", "Notatki", "% ukończenia", "Zdjęcia", "💾 Zapisz"
+# • Dane trwałe w Excelu (DATA_DIR/projects.xlsx)
+# • Arkusz "__Projects" (lista inwestycji, aktywność, zakończenie)
+# • Arkusze per inwestycja z wierszami etapów (bez JSON-ów)
+# • Single-message UI: sticky + back; aktywne wejście tekstowe oznaczane (●)
+# • Brak eksportów (zgodnie z wymaganiem)
 
 import os
 import re
-import json
 import logging
-import shutil
 import calendar as cal
+from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -20,19 +21,20 @@ from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-# ───────────── SharePoint (opcjonalny upload) ─────────────
+# Optional SharePoint (pozostawione jako przyszłościowe – nieużywane jeśli brak env)
 try:
     from office365.sharepoint.client_context import ClientContext
     from office365.runtime.auth.client_credential import ClientCredential
 except ModuleNotFoundError:
     ClientContext = ClientCredential = None
 
-# ───────────── Telegram ─────────────
+# Telegram
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
+    InputFile,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -41,70 +43,49 @@ from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
-    ConversationHandler,
     filters,
+    ConversationHandler,
 )
 from telegram.error import BadRequest
 
-# ───────────── File locking & atomic save ─────────────
+# Lock & atomic save
 import tempfile
 import portalocker
 
 # ──────────────────── konfiguracja ────────────────────
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # MUST HAVE
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", 8080))
 
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
-BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-os.makedirs(BACKUP_DIR, exist_ok=True)
-BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "20"))
-
-# opcjonalne SharePoint
-SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
-SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB")
-SHAREPOINT_CLIENT_ID = os.getenv("SHAREPOINT_CLIENT_ID")
-SHAREPOINT_CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
 
 EXCEL_FILE = os.path.join(DATA_DIR, "projects.xlsx")
-MAPPING_FILE = os.path.join(DATA_DIR, "project_msgs.json")
-PROJECTS_FILE = os.path.join(DATA_DIR, "projects.json")
 LOCK_FILE = os.path.join(DATA_DIR, "projects.lock")
 
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+# ──────────────────── stałe ────────────────────
+PROJECTS_SHEET = "__Projects"
+PROJECTS_HEADERS = ["Project", "Active", "Finished", "CreatedAt"]
 
-# ──────────────────── stałe excela ────────────────────
-HEADERS = [
-    "ID",              # {user_id}_{dd.mm.YYYY}_{idx}
-    "Data",
-    "Imię",
-    "Inwestycja",
-    "Etap",            # "Etap 1"..."Etap 6", "Prace dodatkowe", "Zakończenie"
-    "% ukończenia",    # 0..100
-    "Do dokończenia",  # tekst
-    "Skończone?",      # Tak/Nie/-
+STAGES = ["Etap 1", "Etap 2", "Etap 3", "Etap 4", "Etap 5", "Etap 6", "Prace dodatkowe"]
+STAGE_HEADERS = [
+    "Stage",         # nazwa etapu
+    "Percent",       # 0..100 (string/number)
+    "ToFinish",      # tekst (lista/akapit)
+    "Notes",         # tekst
+    "Finished",      # Tak/Nie/-
+    "LastUpdated",   # dd.mm.YYYY HH:MM
+    "Photos",        # file_id-y Telegrama, rozdzielone spacją
+    "LastEditor",    # imię
+    "LastEditorId",  # id
 ]
-COLS = {name: i + 1 for i, name in enumerate(HEADERS)}
 
-# ──────────────────── stany konwersacji ────────────────────
-(
-    DATE_PICK,              # wybór daty
-    PROJECT_LIST,           # lista inwestycji
-    ADD_PROJECT,            # wpisanie nazwy inwestycji
-    SELECT_STAGE,           # wybór etapu w inwestycji
-    STAGE_MENU,             # submenu etapu
-    TODO_INPUT,             # wpisanie "co dokończyć"
-    PERCENT_INPUT,          # wpisanie % ręcznie
-    FINISHED_DECIDE,        # tak/nie
-    EDIT_PICK_ENTRY,        # wybór wpisu do edycji
-    EDIT_PICK_FIELD,        # wybór pola do edycji
-    EDIT_VALUE,             # wartość nowa
-) = range(11)
+# stany
+DATE_PICK = 10
 
-# ──────────────────── helpers: excel/lock/backup ────────────────────
+# ──────────────────── Excel helpers ────────────────────
 def _atomic_save_wb(wb: Workbook, path: str) -> None:
     fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
     os.close(fd)
@@ -115,172 +96,166 @@ def _with_lock(fn, *args, **kwargs):
     with portalocker.Lock(LOCK_FILE, timeout=30):
         return fn(*args, **kwargs)
 
-def _backup_file():
-    if not os.path.exists(EXCEL_FILE):
-        return
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = os.path.join(BACKUP_DIR, f"projects_{ts}.xlsx")
-    try:
-        shutil.copy2(EXCEL_FILE, dst)
-    except Exception as e:
-        logging.warning("Backup failed: %s", e)
-    files = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("projects_") and f.endswith(".xlsx")])
-    if len(files) > BACKUP_KEEP:
-        for old in files[: len(files) - BACKUP_KEEP]:
-            try:
-                os.remove(os.path.join(BACKUP_DIR, old))
-            except Exception:
-                pass
-
 def open_wb() -> Workbook:
     if os.path.exists(EXCEL_FILE):
         return load_workbook(EXCEL_FILE)
-    return Workbook()
+    wb = Workbook()
+    # init Projects sheet
+    ws = wb.active
+    ws.title = PROJECTS_SHEET
+    ws.append(PROJECTS_HEADERS)
+    _atomic_save_wb(wb, EXCEL_FILE)
+    return wb
 
-def month_key_from_date(date_str: str) -> str:
-    d = datetime.strptime(date_str, "%d.%m.%Y")
-    return f"{d.year:04d}-{d.month:02d}"
-
-def ensure_month_sheet(wb: Workbook, month_key: str) -> Worksheet:
-    ws: Optional[Worksheet] = wb[month_key] if month_key in wb.sheetnames else None
-    if ws is None:
-        ws = wb.create_sheet(title=month_key, index=0)
-        ws.append(HEADERS)
-        if "Sheet" in wb.sheetnames and wb["Sheet"].max_row == 1 and wb["Sheet"].max_column == 1:
-            wb.remove(wb["Sheet"])
+def ensure_projects_sheet(wb: Workbook) -> Worksheet:
+    if PROJECTS_SHEET not in wb.sheetnames:
+        ws = wb.create_sheet(PROJECTS_SHEET, index=0)
+        ws.append(PROJECTS_HEADERS)
     else:
-        idx = wb.sheetnames.index(month_key)
-        if idx != 0:
-            wb.move_sheet(ws, offset=-idx)
+        ws = wb[PROJECTS_SHEET]
+        if ws.max_row < 1:
+            ws.append(PROJECTS_HEADERS)
     return ws
 
-def get_month_sheet_if_exists(wb: Workbook, month_key: str) -> Optional[Worksheet]:
-    return wb[month_key] if month_key in wb.sheetnames else None
-
-def save_entry(user_id: int, date_str: str, name: str, project: str, etap: str,
-               percent: Optional[int], todo: str, finished: Optional[str]) -> None:
-    """Append nowy wpis."""
-    def _save():
-        wb = open_wb()
-        ws = ensure_month_sheet(wb, month_key_from_date(date_str))
-
-        prefix = f"{user_id}_{date_str}_"
-        existing_idxs: List[int] = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            rid = str(row[0]) if row and row[0] is not None else ""
-            if rid.startswith(prefix):
-                try:
-                    existing_idxs.append(int(rid.split("_")[-1]))
-                except Exception:
-                    pass
-        next_idx = (max(existing_idxs) + 1) if existing_idxs else 1
-
-        ws.append([
-            f"{user_id}_{date_str}_{next_idx}",
-            date_str,
-            name,
-            project,
-            etap,
-            percent if percent is not None else "",
-            todo or "",
-            finished or "-",
-        ])
-        _backup_file()
-        _atomic_save_wb(wb, EXCEL_FILE)
-    _with_lock(_save)
-    _maybe_upload_sharepoint()
-
-def read_entries_for_day_project(user_id: int, date_str: str, project: str) -> List[Dict[str, str]]:
-    if not os.path.exists(EXCEL_FILE):
-        return []
+def list_projects(active_only: bool = True) -> List[Dict[str, str]]:
     def _read():
-        wb = load_workbook(EXCEL_FILE)
-        ws = get_month_sheet_if_exists(wb, month_key_from_date(date_str))
-        if not ws:
-            return []
-        prefix = f"{user_id}_{date_str}_"
+        wb = open_wb()
+        ws = ensure_projects_sheet(wb)
         out = []
-        for row in ws.iter_rows(min_row=2, values_only=False):
-            rid = str(row[0].value) if row and row[0] is not None else ""
-            if rid and rid.startswith(prefix) and (row[COLS["Inwestycja"] - 1].value or "") == project:
-                out.append({
-                    "rid": rid,
-                    "row": row[0].row,
-                    "date": row[COLS["Data"] - 1].value,
-                    "name": row[COLS["Imię"] - 1].value,
-                    "project": row[COLS["Inwestycja"] - 1].value,
-                    "etap": row[COLS["Etap"] - 1].value,
-                    "percent": row[COLS["% ukończenia"] - 1].value or "",
-                    "todo": row[COLS["Do dokończenia"] - 1].value or "",
-                    "finished": row[COLS["Skończone?"] - 1].value or "-",
-                })
-        # sort by idx in RID
-        out.sort(key=lambda e: int(e["rid"].split("_")[-1]))
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row or not row[0]:
+                continue
+            prj = {
+                "name": row[0],
+                "active": (str(row[1]).lower() != "false"),
+                "finished": (str(row[2]).lower() == "true"),
+                "created": row[3],
+            }
+            if not active_only or prj["active"]:
+                out.append(prj)
         return out
     return _with_lock(_read)
 
-def update_entry_field(date_str: str, rid: str, field: str, new_value: str) -> None:
+def add_project(name: str) -> None:
+    name = name.strip()
+    if not name:
+        return
     def _upd():
-        wb = load_workbook(EXCEL_FILE)
-        ws = ensure_month_sheet(wb, month_key_from_date(date_str))
-        col_name_map = {
-            "etap": "Etap",
-            "percent": "% ukończenia",
-            "todo": "Do dokończenia",
-            "finished": "Skończone?",
-        }
-        target_col = COLS[col_name_map[field]]
-        target_row = None
-        for row in ws.iter_rows(min_row=2, values_only=False):
-            if str(row[0].value) == rid:
-                target_row = row[0].row
-                break
-        if not target_row:
-            raise RuntimeError("Nie znaleziono wiersza do edycji.")
-        ws.cell(row=target_row, column=target_col, value=new_value)
-        _backup_file()
+        wb = open_wb()
+        ws = ensure_projects_sheet(wb)
+        # check exists
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and row[0] == name:
+                return
+        ws.append([name, True, False, datetime.now().isoformat()])
+        # create project sheet
+        if name not in wb.sheetnames:
+            ws2 = wb.create_sheet(name)
+            ws2.append(STAGE_HEADERS)
+            for st in STAGES:
+                ws2.append([st, "", "", "", "-", "", "", "", ""])
         _atomic_save_wb(wb, EXCEL_FILE)
     _with_lock(_upd)
-    _maybe_upload_sharepoint()
 
-def _maybe_upload_sharepoint() -> None:
-    if all([ClientContext, SHAREPOINT_SITE, SHAREPOINT_DOC_LIB, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET]):
-        try:
-            ctx = ClientContext(SHAREPOINT_SITE).with_credentials(
-                ClientCredential(SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET)
-            )
-            folder = ctx.web.get_folder_by_server_relative_url(SHAREPOINT_DOC_LIB)
-            with open(EXCEL_FILE, "rb") as f:
-                folder.upload_file(os.path.basename(EXCEL_FILE), f).execute_query()
-        except Exception as e:
-            logging.warning("SharePoint upload failed: %s", e)
-
-# ──────────────────── helpers: projekty (lista) ────────────────────
-def load_projects() -> List[Dict[str, str]]:
-    if os.path.exists(PROJECTS_FILE):
-        with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
-            try:
-                arr = json.load(f)
-                if isinstance(arr, list):
-                    return arr
-            except Exception:
-                pass
-    return []
-
-def save_projects(projects: List[Dict[str, str]]) -> None:
-    with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(projects, f, ensure_ascii=False, indent=2)
-
-def add_project(name: str) -> None:
+def archive_project(name: str, active: bool) -> None:
     def _upd():
-        projects = load_projects()
-        names = {p["name"] for p in projects}
-        if name not in names:
-            projects.insert(0, {"name": name, "created_at": datetime.now().isoformat(), "active": True})
-            save_projects(projects)
+        wb = open_wb()
+        ws = ensure_projects_sheet(wb)
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, 1).value == name:
+                ws.cell(r, 2, True if active else False)
+                break
+        _atomic_save_wb(wb, EXCEL_FILE)
     _with_lock(_upd)
 
-# ──────────────────── helpers: Telegram (sticky/safe_answer/UI) ────────────────────
+def set_project_finished(name: str, finished: bool) -> None:
+    def _upd():
+        wb = open_wb()
+        ws = ensure_projects_sheet(wb)
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, 1).value == name:
+                ws.cell(r, 3, True if finished else False)
+                break
+        _atomic_save_wb(wb, EXCEL_FILE)
+    _with_lock(_upd)
+
+def ensure_project_sheet(name: str) -> Worksheet:
+    wb = open_wb()
+    if name not in wb.sheetnames:
+        ws2 = wb.create_sheet(name)
+        ws2.append(STAGE_HEADERS)
+        for st in STAGES:
+            ws2.append([st, "", "", "", "-", "", "", "", ""])
+        _atomic_save_wb(wb, EXCEL_FILE)
+    return wb[name]
+
+def read_stage(name: str, stage: str) -> Dict[str, str]:
+    def _read():
+        ws = ensure_project_sheet(name)
+        idx = {h: i for i, h in enumerate(STAGE_HEADERS)}  # 0-based
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and row[0] == stage:
+                return {
+                    "Stage": row[idx["Stage"]],
+                    "Percent": row[idx["Percent"]] if row[idx["Percent"]] != None else "",
+                    "ToFinish": row[idx["ToFinish"]] or "",
+                    "Notes": row[idx["Notes"]] or "",
+                    "Finished": row[idx["Finished"]] or "-",
+                    "LastUpdated": row[idx["LastUpdated"]] or "",
+                    "Photos": row[idx["Photos"]] or "",
+                    "LastEditor": row[idx["LastEditor"]] or "",
+                    "LastEditorId": row[idx["LastEditorId"]] or "",
+                }
+        # jeśli nie ma – utwórz wiersz
+        ws2 = ensure_project_sheet(name)
+        ws2.append([stage, "", "", "", "-", "", "", "", ""])
+        _atomic_save_wb(ws2.parent, EXCEL_FILE)
+        return {
+            "Stage": stage, "Percent": "", "ToFinish": "", "Notes": "",
+            "Finished": "-", "LastUpdated": "", "Photos": "", "LastEditor": "", "LastEditorId": ""
+        }
+    return _with_lock(_read)
+
+def update_stage(name: str, stage: str, updates: Dict[str, str], editor_name: str, editor_id: int) -> None:
+    allowed = set(STAGE_HEADERS) - {"Stage"}
+    for k in updates.keys():
+        if k not in allowed:
+            raise ValueError(f"Unsupported field: {k}")
+    def _upd():
+        wb = open_wb()
+        ws = ensure_project_sheet(name)
+        headers = [c.value for c in ws[1]]
+        hidx = {h: i+1 for i, h in enumerate(headers)}  # 1-based
+        target_row = None
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, hidx["Stage"]).value == stage:
+                target_row = r
+                break
+        if target_row is None:
+            target_row = ws.max_row + 1
+            ws.append([stage] + [""]*(len(headers)-1))
+        # write
+        for k, v in updates.items():
+            ws.cell(target_row, hidx[k], v)
+        # metadata
+        ws.cell(target_row, hidx["LastUpdated"], datetime.now().strftime("%d.%m.%Y %H:%M"))
+        ws.cell(target_row, hidx["LastEditor"], editor_name)
+        ws.cell(target_row, hidx["LastEditorId"], str(editor_id))
+        _atomic_save_wb(wb, EXCEL_FILE)
+    _with_lock(_upd)
+
+# ──────────────────── UI helpers ────────────────────
+async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
+    try:
+        if text is not None:
+            await q.answer(text=text, show_alert=show_alert)
+        else:
+            await q.answer()
+    except BadRequest:
+        pass
+    except Exception:
+        pass
+
 async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
     chat = update_or_ctx.effective_chat if isinstance(update_or_ctx, Update) else None
     chat_id = chat.id if chat else update_or_ctx.callback_query.message.chat.id
@@ -305,14 +280,6 @@ async def sticky_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         except Exception:
             pass
         context.user_data.pop("sticky_id", None)
-
-async def safe_answer(q):
-    try:
-        await q.answer()
-    except BadRequest:
-        pass
-    except Exception:
-        pass
 
 def today_str() -> str:
     return datetime.now().strftime("%d.%m.%Y")
@@ -342,21 +309,59 @@ def month_kb(year: int, month: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("Dziś", callback_data=f"day:{today_str()}"),
         InlineKeyboardButton("Następny »", callback_data=f"cal:{next_month.year}-{next_month.month:02d}"),
     ])
+    rows.append([InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")])
     return InlineKeyboardMarkup(rows)
 
-def build_projects_menu(date_str: str) -> InlineKeyboardMarkup:
-    projects = load_projects()
-    rows = [[InlineKeyboardButton(f"📅 Data: {date_str}", callback_data="change_date")]]
-    if projects:
-        for i, p in enumerate(projects):
-            if p.get("active", True):
-                rows.append([InlineKeyboardButton(p["name"], callback_data=f"proj:{i}")])
-    rows.append([InlineKeyboardButton("➕ Dodaj inwestycję", callback_data="add_project")])
-    rows.append([InlineKeyboardButton("📥 Eksport", callback_data="export"),
-                 InlineKeyboardButton("📥 Mój eksport", callback_data="myexport")])
+# ──────────────────── Renderers ────────────────────
+def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
+    aw = context.user_data.get("await") or {}
+    if not aw:
+        return ""
+    field = aw.get("field")
+    proj = context.user_data.get("project", "")
+    stage = context.user_data.get("stage", "")
+    name_map = {"todo": "Do dokończenia", "notes": "Notatki", "photo": "Zdjęcie"}
+    return f"✍️ *Oczekuję na:* {name_map.get(field, field)} (inwestycja: {proj} | {stage}). Wyślij teraz.\n"
+
+def projects_menu_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    ds = context.user_data.get("date", today_str())
+    lines = []
+    b = banner_await(context)
+    if b: lines.append(b)
+    lines.append(f"🏗️ *Inwestycje*  |  📅 {ds}\n")
+    projs = list_projects(active_only=True)
+    if not projs:
+        lines.append("Brak inwestycji. Dodaj pierwszą 👇")
+    return "\n".join(lines)
+
+def projects_menu_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    ds = context.user_data.get("date", today_str())
+    projs = list_projects(active_only=True)
+    rows = [[InlineKeyboardButton(f"📅 Data: {ds}", callback_data="date:open")]]
+    for i, p in enumerate(projs):
+        rows.append([InlineKeyboardButton(f"🏗️ {p['name']}", callback_data=f"proj:open:{i}")])
+    rows.append([InlineKeyboardButton("➕ Dodaj inwestycję", callback_data="proj:add")])
+    rows.append([InlineKeyboardButton("🗄 Archiwum", callback_data="proj:arch")])
     return InlineKeyboardMarkup(rows)
 
-def build_project_panel(project_name: str) -> InlineKeyboardMarkup:
+def project_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    proj = context.user_data.get("project")
+    b = banner_await(context)
+    lines = []
+    if b: lines.append(b)
+    # Krótki podgląd otwartych "Do dokończenia" z etapów
+    lines.append(f"🏗️ *{proj}*")
+    lines.append("👇 Wybierz etap. Otwarte zadania:")
+    for st in STAGES:
+        stdata = read_stage(proj, st)
+        tf = stdata["ToFinish"].strip()
+        if tf:
+            preview = tf if len(tf) <= 60 else tf[:57] + "…"
+            lines.append(f"• {st}: 🔧 {preview}")
+    return "\n".join(lines)
+
+def project_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    proj = context.user_data.get("project")
     rows = [
         [InlineKeyboardButton("Etap 1", callback_data="stage:Etap 1"),
          InlineKeyboardButton("Etap 2", callback_data="stage:Etap 2")],
@@ -364,25 +369,51 @@ def build_project_panel(project_name: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("Etap 4", callback_data="stage:Etap 4")],
         [InlineKeyboardButton("Etap 5", callback_data="stage:Etap 5"),
          InlineKeyboardButton("Etap 6", callback_data="stage:Etap 6")],
-        [InlineKeyboardButton("Prace dodatkowe (7)", callback_data="stage:Prace dodatkowe")],
-        [InlineKeyboardButton("✅ Czy inwestycja skończona?", callback_data="finished")],
-        [InlineKeyboardButton("📝 Edytuj dzisiejsze wpisy", callback_data="edit_today")],
-        [InlineKeyboardButton("↩️ Powrót", callback_data="back_projects")],
+        [InlineKeyboardButton("Prace dodatkowe", callback_data="stage:Prace dodatkowe")],
+        [InlineKeyboardButton("✅ Oznacz inwestycję jako ZAKOŃCZONĄ", callback_data="proj:finish")],
+        [InlineKeyboardButton("📦 Archiwizuj/Przywróć", callback_data="proj:toggle_active")],
+        [InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")],
     ]
     return InlineKeyboardMarkup(rows)
 
-def build_stage_menu(etap: str, percent: Optional[int], todo: Optional[str]) -> InlineKeyboardMarkup:
-    shown_percent = "-" if percent is None else f"{percent}%"
-    shown_todo = "-" if not todo else (todo if len(todo) <= 40 else todo[:37] + "…")
+def stage_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    proj = context.user_data.get("project")
+    stage = context.user_data.get("stage")
+    data = read_stage(proj, stage)
+    b = banner_await(context)
+    lines = []
+    if b: lines.append(b)
+    lines.extend([
+        f"🏗️ *{proj}*  →  {stage}",
+        "",
+        f"📊 % ukończenia: {data['Percent'] if data['Percent'] != '' else '-'}",
+        f"🔧 Do dokończenia:\n{data['ToFinish'] or '-'}",
+        f"📝 Notatki:\n{data['Notes'] or '-'}",
+        f"🖼 Zdjęcia: {len((data['Photos'] or '').split()) if (data['Photos'] or '').strip() else 0}",
+        f"⏱ Ostatnia zmiana: {data['LastUpdated'] or '-'}  |  👤 {data['LastEditor'] or '-'}",
+        "",
+        "Wybierz działanie poniżej 👇",
+    ])
+    return "\n".join(lines)
+
+def stage_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    aw = context.user_data.get("await") or {}
+    field_active = aw.get("field") if aw.get("mode") == "text" else None
+    def mark(label, key):  # dodaje ● przy aktywnym polu
+        return f"{'● ' if field_active == key else ''}{label}"
     rows = [
-        [InlineKeyboardButton(f"🔧 Do dokończenia: {shown_todo}", callback_data="set_todo")],
-        [InlineKeyboardButton(f"📊 Na ile %: {shown_percent}", callback_data="set_percent")],
-        [InlineKeyboardButton("💾 Zapisz wpis", callback_data="save_stage")],
-        [InlineKeyboardButton("↩️ Powrót", callback_data="back_project")],
+        [InlineKeyboardButton(mark("🔧 Do dokończenia", "todo"), callback_data="stage:set:todo"),
+         InlineKeyboardButton(mark("📝 Notatki", "notes"), callback_data="stage:set:notes")],
+        [InlineKeyboardButton("📊 % (0/25/50/75/90/100)", callback_data="stage:set:percent"),
+         InlineKeyboardButton("📸 Dodaj zdjęcie", callback_data="stage:add_photo")],
+        [InlineKeyboardButton("🧹 Wyczyść Do dokończenia", callback_data="stage:clear:todo"),
+         InlineKeyboardButton("🧹 Wyczyść Notatki", callback_data="stage:clear:notes")],
+        [InlineKeyboardButton("💾 Zapisz zmiany", callback_data="stage:save")],
+        [InlineKeyboardButton("↩️ Wstecz", callback_data="proj:back")],
     ]
     return InlineKeyboardMarkup(rows)
 
-def build_percent_kb() -> InlineKeyboardMarkup:
+def percent_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("0%", callback_data="pct:0"),
          InlineKeyboardButton("25%", callback_data="pct:25"),
@@ -391,78 +422,43 @@ def build_percent_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("90%", callback_data="pct:90"),
          InlineKeyboardButton("100%", callback_data="pct:100")],
         [InlineKeyboardButton("✍️ Wpisz ręcznie", callback_data="pct:manual")],
-        [InlineKeyboardButton("↩️ Wróć", callback_data="pct:back")],
+        [InlineKeyboardButton("↩️ Powrót", callback_data="stage:back")],
     ]
     return InlineKeyboardMarkup(rows)
 
-def format_summary(entries: List[Dict[str, str]], date_str: str, project: str, name: str) -> str:
-    lines = [f"🏗️ Inwestycja: {project}", f"📅 Data: {date_str}", f"👤 Imię: {name}", ""]
-    if not entries:
-        lines.append("Brak wpisów.")
-        return "\n".join(lines)
-    for i, e in enumerate(entries, start=1):
-        lines.extend([
-            f"#{i} — {e['etap']}",
-            f"   📊 %: {e['percent'] if e['percent'] != '' else '-'}",
-            f"   🔧 Do dokończenia: {e['todo'] if e['todo'] else '-'}",
-            f"   ✅ Skończone?: {e['finished'] or '-'}",
-            "",
-        ])
-    return "\n".join(lines)
+# ──────────────────── Render central ────────────────────
+async def render_home(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
+    await sticky_set(update_or_ctx, context, projects_menu_text(context), projects_menu_kb(context))
 
-def load_mapping() -> Dict[str, int]:
-    if os.path.exists(MAPPING_FILE):
-        with open(MAPPING_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+async def render_project(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
+    await sticky_set(update_or_ctx, context, project_panel_text(context), project_panel_kb(context))
 
-def save_mapping(mapping: Dict[str, int]) -> None:
-    with open(MAPPING_FILE, "w", encoding="utf-8") as f:
-        json.dump(mapping, f)
+async def render_stage(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
+    await sticky_set(update_or_ctx, context, stage_panel_text(context), stage_panel_kb(context))
 
-# ──────────────────── EXPORT ────────────────────
-def export_month(month_key: str, user_id: Optional[int] = None) -> Optional[str]:
-    if not os.path.exists(EXCEL_FILE):
-        return None
-    def _exp() -> Optional[str]:
-        wb = load_workbook(EXCEL_FILE)
-        if month_key not in wb.sheetnames:
-            return None
-        ws = wb[month_key]
-        out = Workbook()
-        wso = out.active
-        wso.title = month_key
-        wso.append(HEADERS)
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]:
-                continue
-            if user_id and not str(row[0]).startswith(f"{user_id}_"):
-                continue
-            wso.append(list(row))
-        tmpf = os.path.join(DATA_DIR, f"export_{month_key}_{user_id or 'ALL'}.xlsx")
-        _atomic_save_wb(out, tmpf)
-        return tmpf
-    return _with_lock(_exp)
-
-# ──────────────────── HANDLERY ────────────────────
+# ──────────────────── Handlers ────────────────────
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    sel_date = today_str()
-    context.user_data["date"] = sel_date
-    await sticky_set(update, context, "Wybierz inwestycję lub dodaj nową:", build_projects_menu(sel_date))
+    context.user_data["date"] = today_str()
+    await render_home(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        "Użyj /start: wybierz datę, inwestycję, etap i uzupełnij pola. "
-        "Wpisy zapisują się do Excela. Dostępne: eksporty, edycja dzisiejszych wpisów."
+    text = (
+        "🤖 *Pomoc – Inwestycje*\n"
+        "• /start – lista inwestycji (wspólna), dodanie nowej.\n"
+        "• Panel → wybierz inwestycję → etap → edytuj pola.\n"
+        "• Pola tekstowe: po wciśnięciu przycisku wyślij wiadomość; zostanie skasowana i zapisana.\n"
+        "• Zdjęcia: wybierz „Dodaj zdjęcie”, potem prześlij foto – zapiszę `file_id` (bez pobierania pliku).\n"
+        "• Wszystko zapisuje się w Excelu (`projects.xlsx`) per inwestycja.\n"
     )
+    await sticky_set(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")]]))
 
-# --- zmiana daty (kalendarz) ---
-async def change_date_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- nawigacja daty ---
+async def date_open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
     now = datetime.now()
-    await sticky_set(update, context, "📅 Wybierz datę:", month_kb(now.year, now.month))
+    await sticky_set(update, context, "📅 Wybierz datę (poggląd w panelu):", month_kb(now.year, now.month))
     return DATE_PICK
 
 async def calendar_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -472,416 +468,254 @@ async def calendar_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("cal:"):
         y, m = map(int, data.split(":")[1].split("-"))
         await sticky_set(update, context, "📅 Wybierz datę:", month_kb(y, m))
+        return DATE_PICK
     elif data.startswith("day:"):
         ds = data.split(":")[1]
         context.user_data["date"] = ds
-        await sticky_set(update, context, "Wybierz inwestycję lub dodaj nową:", build_projects_menu(ds))
+        await render_home(update, context)
         return ConversationHandler.END
     return DATE_PICK
 
-# --- lista inwestycji / dodanie nowej ---
+# --- lista inwestycji ---
 async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
     data = q.data
 
-    if data == "add_project":
-        await sticky_set(update, context, "🏷 Podaj nazwę inwestycji (miejscowość/nazwa):\n\n(tekst)")
-        return ADD_PROJECT
+    if data == "nav:home":
+        await render_home(update, context)
+        return
 
-    if data.startswith("proj:"):
-        idx = int(data.split(":")[1])
-        projects = load_projects()
-        if idx < 0 or idx >= len(projects):
-            await sticky_set(update, context, "Nie znaleziono inwestycji.", build_projects_menu(context.user_data.get("date", today_str())))
-            return ConversationHandler.END
-        proj = projects[idx]["name"]
-        context.user_data["project"] = proj
-        await sticky_set(update, context, f"🏗️ {proj}\nWybierz etap:", build_project_panel(proj))
-        return SELECT_STAGE
+    if data == "proj:add":
+        context.user_data["await"] = {"mode": "text", "field": "project_name"}
+        await render_home(update, context)
+        return
 
-    # eksporty
-    if data in {"export", "myexport"}:
-        # obsłużą dedykowane handlery
-        return ConversationHandler.END
+    if data == "proj:arch":
+        # pokaz aktywne/archiwum przełączalnie
+        projs_all = list_projects(active_only=False)
+        kb = []
+        for p in projs_all:
+            state = "🟢" if p["active"] else "⚪️"
+            kb.append([InlineKeyboardButton(f"{state} {p['name']}", callback_data=f"proj:toggle:{p['name']}")])
+        kb.append([InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")])
+        await sticky_set(update, context, "🗄 *Archiwum / Aktywne*\nKliknij aby przełączyć:", InlineKeyboardMarkup(kb))
+        return
 
-    if data == "change_date":
-        return await change_date_cb(update, context)
+    if data.startswith("proj:toggle:"):
+        name = data.split(":", 2)[2]
+        # przełącz aktywność
+        current = {p["name"]: p for p in list_projects(active_only=False)}.get(name)
+        if current:
+            archive_project(name, active=not current["active"])
+        await projects_router(update, context)  # odśwież widok archiwum
+        return
 
-    return ConversationHandler.END
+    if data.startswith("proj:open:"):
+        idx = int(data.split(":")[2])
+        projs = list_projects(active_only=True)
+        if 0 <= idx < len(projs):
+            context.user_data["project"] = projs[idx]["name"]
+            await render_project(update, context)
+        else:
+            await render_home(update, context)
+        return
 
-async def add_project_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # kasuj wiadomość użytkownika
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    name = (update.message.text or "").strip()
-    if not name:
-        await sticky_set(update, context, "Nazwa nie może być pusta. Podaj nazwę inwestycji:")
-        return ADD_PROJECT
-    add_project(name)
-    await sticky_set(update, context, "Dodano. Wybierz inwestycję lub dodaj kolejną:", build_projects_menu(context.user_data.get("date", today_str())))
-    return ConversationHandler.END
+    if data == "proj:finish":
+        proj = context.user_data.get("project")
+        if not proj:
+            await render_home(update, context)
+            return
+        set_project_finished(proj, True)
+        await sticky_set(update, context, f"🎉 *{proj}* oznaczono jako *zakończoną*. Świetna robota! 💪", InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wróć do projektu", callback_data="proj:back")]]))
+        return
 
-# --- panel projektu (etapy) ---
-async def project_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if data == "proj:toggle_active":
+        proj = context.user_data.get("project")
+        if not proj:
+            await render_home(update, context)
+            return
+        allp = {p["name"]: p for p in list_projects(active_only=False)}
+        cur = allp.get(proj)
+        if cur:
+            archive_project(proj, active=not cur["active"])
+        await render_home(update, context)
+        return
+
+    if data == "proj:back":
+        await render_project(update, context)
+        return
+
+# --- panel etapu ---
+async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
     data = q.data
-    project = context.user_data.get("project")
-    if not project:
-        await sticky_set(update, context, "Brak kontekstu inwestycji.", build_projects_menu(context.user_data.get("date", today_str())))
-        return ConversationHandler.END
-
-    if data == "back_projects":
-        await sticky_set(update, context, "Wybierz inwestycję lub dodaj nową:", build_projects_menu(context.user_data.get("date", today_str())))
-        return ConversationHandler.END
-
-    if data == "edit_today":
-        entries = read_entries_for_day_project(update.effective_user.id, context.user_data.get("date", today_str()), project)
-        if not entries:
-            await sticky_set(update, context, "Brak dzisiejszych wpisów dla tej inwestycji.", build_project_panel(project))
-            return SELECT_STAGE
-        context.user_data["edit_entries"] = entries
-        kb = [[InlineKeyboardButton(f"#{i+1} {e['etap']} ({e['percent']}%)", callback_data=f"edit:{i}")] for i, e in enumerate(entries)]
-        kb.append([InlineKeyboardButton("↩️ Powrót", callback_data="back_project")])
-        await sticky_set(update, context, "Wybierz wpis do edycji:", InlineKeyboardMarkup(kb))
-        return EDIT_PICK_ENTRY
-
-    if data == "finished":
-        kb = [
-            [InlineKeyboardButton("Tak", callback_data="fin:Tak"),
-             InlineKeyboardButton("Nie", callback_data="fin:Nie")],
-            [InlineKeyboardButton("↩️ Powrót", callback_data="back_project")],
-        ]
-        await sticky_set(update, context, "Czy inwestycja skończona?", InlineKeyboardMarkup(kb))
-        return FINISHED_DECIDE
+    proj = context.user_data.get("project")
 
     if data.startswith("stage:"):
-        etap = data.split(":", 1)[1]
-        context.user_data["etap"] = etap
-        # inicjalne wartości
-        context.user_data["stage_todo"] = context.user_data.get("stage_todo", "")
-        context.user_data["stage_percent"] = context.user_data.get("stage_percent", None)
-        await sticky_set(update, context, f"{project} → {etap}\nUzupełnij:", build_stage_menu(etap, context.user_data["stage_percent"], context.user_data["stage_todo"]))
-        return STAGE_MENU
+        parts = data.split(":")
+        if parts[1] == "set":
+            action = parts[2]
+            if action == "todo":
+                context.user_data["await"] = {"mode": "text", "field": "todo"}
+                await render_stage(update, context)
+                return
+            if action == "notes":
+                context.user_data["await"] = {"mode": "text", "field": "notes"}
+                await render_stage(update, context)
+                return
+            if action == "percent":
+                await sticky_set(update, context, "📊 Ustaw % ukończenia:", percent_kb())
+                return
+        elif parts[1] == "clear":
+            field = parts[2]
+            st = context.user_data.get("stage")
+            update_stage(proj, st, {"ToFinish" if field == "todo" else "Notes": ""}, update.effective_user.first_name, update.effective_user.id)
+            await render_stage(update, context)
+            return
+        elif parts[1] == "save":
+            # nic buforowanego — aktualizacje są natychmiastowe po tekście/wyborze; tu tylko feedback
+            await safe_answer(q, text="Zapisano. ✅")
+            await render_stage(update, context)
+            return
+        elif parts[1] == "back":
+            await render_stage(update, context)
+            return
+        else:
+            # stage:<nazwa etapu>
+            stage = data.split(":", 1)[1]
+            context.user_data["stage"] = stage
+            context.user_data.pop("await", None)
+            await render_stage(update, context)
+            return
 
-    if data == "back_project":
-        await sticky_set(update, context, f"🏗️ {project}\nWybierz etap:", build_project_panel(project))
-        return SELECT_STAGE
+    if data == "proj:back":
+        context.user_data.pop("await", None)
+        await render_project(update, context)
+        return
 
-    return SELECT_STAGE
+    if data == "stage:add_photo":
+        context.user_data["await"] = {"mode": "photo", "field": "photo"}
+        await render_stage(update, context)
+        return
 
-# --- submenu etapu ---
-async def stage_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- procenty: gotowe/przez tekst ---
+async def percent_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
     data = q.data
-    project = context.user_data.get("project")
-    etap = context.user_data.get("etap")
-
-    if data == "set_todo":
-        await sticky_set(update, context, "🔧 Wpisz: Jakie prace należy dokończyć?\n\n(tekst)")
-        return TODO_INPUT
-
-    if data == "set_percent":
-        await sticky_set(update, context, "📊 Wybierz % lub wpisz ręcznie:", build_percent_kb())
-        return PERCENT_INPUT
-
-    if data == "save_stage":
-        uid = update.effective_user.id
-        name = update.effective_user.first_name
-        date_str = context.user_data.get("date", today_str())
-        percent = context.user_data.get("stage_percent")
-        todo = context.user_data.get("stage_todo", "")
-        save_entry(uid, date_str, name, project, etap, percent, todo, None)
-        # czyścimy bufor etapu (nie resetujemy nazwy projektu)
-        context.user_data.pop("stage_todo", None)
-        context.user_data.pop("stage_percent", None)
-
-        # pokaż podsumowanie dzisiejszych wpisów dla tej inwestycji
-        entries = read_entries_for_day_project(uid, date_str, project)
-        summary = format_summary(entries, date_str, project, name)
-
-        await sticky_delete(context, q.message.chat.id)
-        msg = await q.message.chat.send_message(summary)
-        mapping = load_mapping()
-        mapping[f"{uid}_{date_str}_{project}"] = msg.message_id
-        save_mapping(mapping)
-
-        # wróć do panelu projektu
-        await sticky_set(update, context, f"🏗️ {project}\nWybierz etap:", build_project_panel(project))
-        return SELECT_STAGE
-
-    if data == "back_project":
-        await sticky_set(update, context, f"🏗️ {project}\nWybierz etap:", build_project_panel(project))
-        return SELECT_STAGE
-
-    return STAGE_MENU
-
-async def todo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    txt = (update.message.text or "").strip()
-    if not txt:
-        await sticky_set(update, context, "Pole nie może być puste. Wpisz co należy dokończyć:")
-        return TODO_INPUT
-    context.user_data["stage_todo"] = txt
-    etap = context.user_data.get("etap")
-    await sticky_set(update, context, "Zapisano. Co dalej?", build_stage_menu(etap, context.user_data.get("stage_percent"), txt))
-    return STAGE_MENU
-
-async def percent_input_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-    data = q.data
-
-    if data == "pct:back":
-        etap = context.user_data.get("etap")
-        await sticky_set(update, context, "Wrócono.", build_stage_menu(etap, context.user_data.get("stage_percent"), context.user_data.get("stage_todo")))
-        return STAGE_MENU
-
+    if data == "stage:back":
+        await render_stage(update, context)
+        return
     if data == "pct:manual":
-        await sticky_set(update, context, "Wpisz wartość % (0-100):")
-        return PERCENT_INPUT
-
+        context.user_data["await"] = {"mode": "text", "field": "percent"}
+        await render_stage(update, context)
+        return
     if data.startswith("pct:"):
         pct = int(data.split(":")[1])
-        context.user_data["stage_percent"] = pct
-        etap = context.user_data.get("etap")
-        await sticky_set(update, context, "Ustawiono %.", build_stage_menu(etap, pct, context.user_data.get("stage_todo")))
-        return STAGE_MENU
+        proj = context.user_data.get("project")
+        st = context.user_data.get("stage")
+        update_stage(proj, st, {"Percent": pct}, q.from_user.first_name, q.from_user.id)
+        await render_stage(update, context)
+        return
 
-    return PERCENT_INPUT
-
-async def percent_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    t = (update.message.text or "").strip()
-    if not re.fullmatch(r"\d{1,3}", t):
-        await sticky_set(update, context, "Podaj liczbę 0-100:")
-        return PERCENT_INPUT
-    val = int(t)
-    if not (0 <= val <= 100):
-        await sticky_set(update, context, "Zakres 0-100. Podaj ponownie:")
-        return PERCENT_INPUT
-    context.user_data["stage_percent"] = val
-    etap = context.user_data.get("etap")
-    await sticky_set(update, context, "Ustawiono %.", build_stage_menu(etap, val, context.user_data.get("stage_todo")))
-    return STAGE_MENU
-
-# --- zakończenie inwestycji ---
-async def finished_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-    project = context.user_data.get("project")
-    if q.data.startswith("fin:"):
-        choice = q.data.split(":")[1]
-        uid = q.from_user.id
-        name = q.from_user.first_name
-        date_str = context.user_data.get("date", today_str())
-        # zapis "Zakończenie"
-        percent = 100 if choice == "Tak" else ""
-        save_entry(uid, date_str, name, project, "Zakończenie", percent if percent != "" else None, "", choice)
-        entries = read_entries_for_day_project(uid, date_str, project)
-        summary = format_summary(entries, date_str, project, name)
-
-        await sticky_delete(context, q.message.chat.id)
-        msg = await q.message.chat.send_message(summary)
-        mapping = load_mapping()
-        mapping[f"{uid}_{date_str}_{project}"] = msg.message_id
-        save_mapping(mapping)
-
-        await sticky_set(update, context, f"🏗️ {project}\nWybierz etap:", build_project_panel(project))
-        return SELECT_STAGE
-
-    if q.data == "back_project":
-        await sticky_set(update, context, f"🏗️ {project}\nWybierz etap:", build_project_panel(project))
-        return SELECT_STAGE
-
-    return FINISHED_DECIDE
-
-# --- eksporty ---
-async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    month_arg = None
-    if update.callback_query and update.callback_query.data == "export":
-        month_arg = month_key_from_date(context.user_data.get("date", today_str()))
-    else:
-        args = getattr(context, "args", []) or []
-        month_arg = args[0] if args else month_key_from_date(today_str())
-
-    if ADMIN_IDS and update.effective_user.id not in ADMIN_IDS:
-        await sticky_set(update, context, "Brak uprawnień do eksportu (tylko admini). Użyj /myexport <YYYY-MM>.")
-        return ConversationHandler.END
-
-    path = export_month(month_arg)
-    if not path:
-        await sticky_set(update, context, f"Brak danych dla {month_arg}.")
-        return ConversationHandler.END
-
-    with open(path, "rb") as f:
-        await update.effective_chat.send_document(f, filename=os.path.basename(path), caption=f"Eksport {month_arg}")
-    try:
-        os.remove(path)
-    except Exception:
-        pass
-    return ConversationHandler.END
-
-async def myexport_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    month_arg = None
-    if update.callback_query and update.callback_query.data == "myexport":
-        month_arg = month_key_from_date(context.user_data.get("date", today_str()))
-    else:
-        args = getattr(context, "args", []) or []
-        month_arg = args[0] if args else month_key_from_date(today_str())
-
-    path = export_month(month_arg, user_id=update.effective_user.id)
-    if not path:
-        await sticky_set(update, context, f"Brak danych dla {month_arg}.")
-        return ConversationHandler.END
-
-    with open(path, "rb") as f:
-        await update.effective_chat.send_document(f, filename=os.path.basename(path), caption=f"Mój eksport {month_arg}")
-    try:
-        os.remove(path)
-    except Exception:
-        pass
-    return ConversationHandler.END
-
-# --- edycja dzisiejszych wpisów ---
-async def edit_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-    data = q.data
-    if data == "back_project":
-        await sticky_set(update, context, f"🏗️ {context.user_data.get('project')}\nWybierz etap:", build_project_panel(context.user_data.get("project")))
-        return SELECT_STAGE
-
-    idx = int(data.split(":")[1])
-    entries = context.user_data.get("edit_entries", [])
-    if idx < 0 or idx >= len(entries):
-        await sticky_set(update, context, "Nieprawidłowy wybór.", build_project_panel(context.user_data.get("project")))
-        return SELECT_STAGE
-    context.user_data["edit_idx"] = idx
-    e = entries[idx]
-    kb = [
-        [InlineKeyboardButton("Etap", callback_data="ef:etap")],
-        [InlineKeyboardButton("% ukończenia", callback_data="ef:percent")],
-        [InlineKeyboardButton("Do dokończenia", callback_data="ef:todo")],
-        [InlineKeyboardButton("Skończone?", callback_data="ef:finished")],
-        [InlineKeyboardButton("↩️ Inny wpis", callback_data="back_edit_list")],
-    ]
-    await sticky_set(update, context, f"Wybrano: #{idx+1} {e['etap']} ({e['percent']}%)\nCo edytować?", InlineKeyboardMarkup(kb))
-    return EDIT_PICK_FIELD
-
-async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-    data = q.data
-
-    if data == "back_edit_list":
-        entries = context.user_data.get("edit_entries", [])
-        kb = [[InlineKeyboardButton(f"#{i+1} {e['etap']} ({e['percent']}%)", callback_data=f"edit:{i}")] for i, e in enumerate(entries)]
-        kb.append([InlineKeyboardButton("↩️ Powrót", callback_data="back_project")])
-        await sticky_set(update, context, "Wybierz wpis:", InlineKeyboardMarkup(kb))
-        return EDIT_PICK_ENTRY
-
-    field = data.split(":")[1]
-    context.user_data["edit_field"] = field
-
-    prompts = {
-        "etap": "Podaj nową nazwę etapu (np. Etap 3 / Prace dodatkowe / Zakończenie):",
-        "percent": "Podaj nowy % (0-100):",
-        "todo": "Podaj nową wartość pola 'Do dokończenia':",
-        "finished": "Podaj wartość 'Skończone?' (Tak/Nie/-):",
-    }
-    await sticky_set(update, context, prompts[field])
-    return EDIT_VALUE
-
-async def edit_value_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- wejścia tekstowe (projekt/etap) ---
+async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
     try:
         await update.message.delete()
     except Exception:
         pass
 
-    val = (update.message.text or "").strip()
-    field = context.user_data.get("edit_field")
-    idx = context.user_data.get("edit_idx")
-    date_str = context.user_data.get("date", today_str())
+    aw = context.user_data.get("await") or {}
+    mode = aw.get("mode")
+    field = aw.get("field")
+    if mode != "text":
+        # ignoruj nieoczekiwane teksty
+        return
 
-    e = context.user_data.get("edit_entries", [])[idx]
+    # dodawanie projektu
+    if field == "project_name":
+        if not txt:
+            await render_home(update, context)
+            return
+        add_project(txt)
+        context.user_data.pop("await", None)
+        await render_home(update, context)
+        return
 
-    # walidacje
-    if field == "percent":
-        if not re.fullmatch(r"\d{1,3}", val):
-            await sticky_set(update, context, "Wpisz liczbę 0-100:")
-            return EDIT_VALUE
-        iv = int(val)
-        if not (0 <= iv <= 100):
-            await sticky_set(update, context, "Zakres 0-100. Spróbuj ponownie:")
-            return EDIT_VALUE
-    elif field == "finished":
-        if val not in {"Tak", "Nie", "-"}:
-            await sticky_set(update, context, "Dozwolone: Tak / Nie / - . Wpisz ponownie:")
-            return EDIT_VALUE
+    # edycja w etapie
+    proj = context.user_data.get("project")
+    st = context.user_data.get("stage")
+    if not proj or not st:
+        context.user_data.pop("await", None)
+        await render_home(update, context)
+        return
 
+    if field == "todo":
+        update_stage(proj, st, {"ToFinish": txt}, update.effective_user.first_name, update.effective_user.id)
+    elif field == "notes":
+        update_stage(proj, st, {"Notes": txt}, update.effective_user.first_name, update.effective_user.id)
+    elif field == "percent":
+        if not re.fullmatch(r"\d{1,3}", txt):
+            await sticky_set(update, context, "📊 Wpisz liczbę 0-100.\n", percent_kb())
+            return
+        val = int(txt)
+        if not (0 <= val <= 100):
+            await sticky_set(update, context, "📊 Zakres 0-100.\n", percent_kb())
+            return
+        update_stage(proj, st, {"Percent": val}, update.effective_user.first_name, update.effective_user.id)
+
+    context.user_data.pop("await", None)
+    await render_stage(update, context)
+
+# --- zdjęcia ---
+async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    aw = context.user_data.get("await") or {}
+    if aw.get("mode") != "photo":
+        return
+    proj = context.user_data.get("project")
+    st = context.user_data.get("stage")
+    if not proj or not st:
+        context.user_data.pop("await", None)
+        return
     try:
-        update_entry_field(date_str, e["rid"], field, val)
-    except Exception as ex:
-        await sticky_set(update, context, f"❌ Błąd zapisu: {ex}")
-        return EDIT_VALUE
+        file_id = update.message.photo[-1].file_id  # najwyższa rozdzielczość
+    except Exception:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+    # zapisz file_id w Photos (spacja-sep)
+    data = read_stage(proj, st)
+    photos = (data["Photos"] or "").split()
+    photos.append(file_id)
+    # limit pamięci — np. 200 fotek na etap
+    photos = photos[-200:]
+    update_stage(proj, st, {"Photos": " ".join(photos)}, update.effective_user.first_name, update.effective_user.id)
+    # usuń wiadomość użytkownika
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    context.user_data.pop("await", None)
+    await render_stage(update, context)
 
-    # odśwież listę edytowalną
-    project = context.user_data.get("project")
-    context.user_data["edit_entries"] = read_entries_for_day_project(update.effective_user.id, date_str, project)
-
-    kb = [
-        [InlineKeyboardButton("Edytuj inne pole", callback_data=f"edit:{idx}")],
-        [InlineKeyboardButton("Edytuj inny wpis", callback_data="back_edit_list")],
-        [InlineKeyboardButton("Pokaż podsumowanie i wyjdź", callback_data="finish_edit")],
-    ]
-    await sticky_set(update, context, "Zmieniono. Co dalej?", InlineKeyboardMarkup(kb))
-    return EDIT_PICK_FIELD
-
-async def finish_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-    project = context.user_data.get("project")
-    date_str = context.user_data.get("date", today_str())
-    uid = q.from_user.id
-    name = q.from_user.first_name
-
-    entries = read_entries_for_day_project(uid, date_str, project)
-    summary = format_summary(entries, date_str, project, name)
-
-    await sticky_delete(context, q.message.chat.id)
-    msg = await q.message.chat.send_message(summary)
-    mapping = load_mapping()
-    mapping[f"{uid}_{date_str}_{project}"] = msg.message_id
-    save_mapping(mapping)
+# --- CANCEL / ERROR ---
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await sticky_delete(context, update.effective_chat.id)
+    except Exception:
+        pass
+    await update.effective_chat.send_message("Anulowano.")
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- eksport CB via inline ---
-async def export_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-    data = q.data
-    if data == "export":
-        return await export_handler(update, context)
-    if data == "myexport":
-        return await myexport_handler(update, context)
-    return ConversationHandler.END
-
-# --- error handler ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
-    if isinstance(err, BadRequest) and "query is too old" in str(err).lower():
+    if isinstance(err, BadRequest) and ("query is too old" in str(err).lower() or "query is not found" in str(err).lower()):
         return
     logging.exception("Unhandled exception: %s", err)
 
@@ -889,47 +723,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def on_startup(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "Otwórz panel inwestycji"),
-        BotCommand("export", "Eksport (admin): /export YYYY-MM"),
-        BotCommand("myexport", "Mój eksport: /myexport YYYY-MM"),
         BotCommand("help", "Pomoc"),
     ])
 
 def build_app() -> Application:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
 
-    # komendy
+    # Komendy
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("export", export_handler))
-    app.add_handler(CommandHandler("myexport", myexport_handler))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("cancel", cancel))
 
-    # global: kalendarz + eksport inline
-    app.add_handler(CallbackQueryHandler(change_date_cb, pattern=r"^change_date$"))
+    # Data
+    app.add_handler(CallbackQueryHandler(date_open_cb, pattern=r"^date:open$"))
     app.add_handler(CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$"))
-    app.add_handler(CallbackQueryHandler(export_cb_router, pattern=r"^(export|myexport)$"))
 
-    # lista inwestycji
-    app.add_handler(CallbackQueryHandler(projects_router, pattern=r"^(add_project|proj:\d+|change_date)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_project_input), ADD_PROJECT)
+    # Projekty
+    app.add_handler(CallbackQueryHandler(projects_router, pattern=r"^(nav:home|proj:add|proj:arch|proj:toggle:[^|]+|proj:open:\d+|proj:finish|proj:toggle_active|proj:back)$"))
 
-    # panel projektu
-    app.add_handler(CallbackQueryHandler(project_panel_router, pattern=r"^(back_projects|edit_today|finished|stage:.*|back_project)$"))
+    # Etapy
+    app.add_handler(CallbackQueryHandler(stage_router, pattern=r"^(stage:(set:(todo|notes|percent)|clear:(todo|notes)|save|back)|stage:Etap 1|stage:Etap 2|stage:Etap 3|stage:Etap 4|stage:Etap 5|stage:Etap 6|stage:Prace dodatkowe|proj:back|stage:add_photo)$"))
+    app.add_handler(CallbackQueryHandler(percent_cb, pattern=r"^(pct:(\d+|manual)|stage:back)$"))
 
-    # submenu etapu
-    app.add_handler(CallbackQueryHandler(stage_menu_router, pattern=r"^(set_todo|set_percent|save_stage|back_project)$"))
-    app.add_handler(CallbackQueryHandler(percent_input_router, pattern=r"^(pct:(?:\d+|manual|back))$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, todo_input), TODO_INPUT)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, percent_manual), PERCENT_INPUT)
+    # Wejścia użytkownika
+    app.add_handler(MessageHandler(filters.PHOTO, photo_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
 
-    # zakończenie inwestycji
-    app.add_handler(CallbackQueryHandler(finished_decide, pattern=r"^(fin:(Tak|Nie)|back_project)$"))
-
-    # edycja dzisiejszych wpisów
-    app.add_handler(CallbackQueryHandler(edit_pick_entry, pattern=r"^edit:\d+$"))
-    app.add_handler(CallbackQueryHandler(edit_pick_field, pattern=r"^(ef:(etap|percent|todo|finished)|back_edit_list)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value_input), EDIT_VALUE)
-    app.add_handler(CallbackQueryHandler(finish_edit_cb, pattern=r"^finish_edit$"))
-
+    # Errors
     app.add_error_handler(error_handler)
     return app
 
@@ -940,14 +760,14 @@ if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         raise SystemExit("Brak TELEGRAM_TOKEN w env.")
 
-    bot_app = build_app()
+    app = build_app()
 
     if WEBHOOK_URL:
-        bot_app.run_webhook(
+        app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=TELEGRAM_TOKEN,
             webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
         )
     else:
-        bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
