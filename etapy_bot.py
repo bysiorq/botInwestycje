@@ -717,7 +717,8 @@ def build_app() -> Application:
 
     # panel etapu + procenty
     app.add_handler(CallbackQueryHandler(stage_router, pattern=r"^(stage:open:S[1-7]|stage:set:(todo|notes)|stage:set:percent:S[1-7]|stage:clear:(todo|notes):S[1-7]|stage:save:S[1-7]|proj:back|stage:add_photo)$"))
-    app.add_handler(CallbackQueryHandler(percent_cb, pattern=r"^(pct:(S[1-7]):(\\d+|manual)|pct:back)$"))
+    # 🔧 FIX REGEX: użyj (\d+|manual), nie (\\d+|manual)
+    app.add_handler(CallbackQueryHandler(percent_cb, pattern=r"^(pct:(S[1-7]):(\d+|manual)|pct:back)$"))
 
     # wejścia
     app.add_handler(MessageHandler(filters.PHOTO, photo_input))
