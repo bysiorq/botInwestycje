@@ -1,4 +1,4 @@
-# ────────────────────────── etapy_bot.py (2025-08 • SQLite + solidny sticky panel) ──────────────────────────
+# ────────────────────────── etapy_bot.py (2025-08 • SQLite + sticky self-heal + drop_pending) ──────────────────────────
 import os
 import re
 import json
@@ -184,6 +184,11 @@ def set_project_finished(name: str, finished: bool) -> None:
     cur.execute("UPDATE projects SET finished=? WHERE name=?;", (1 if finished else 0, name))
     conn.commit(); conn.close()
 
+def delete_project(name: str) -> None:
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM projects WHERE name=?;", (name,))
+    conn.commit(); conn.close()
+
 def read_stage(project: str, stage_name: str) -> Dict[str, str]:
     pid = _get_project_id(project)
     if not pid:
@@ -267,38 +272,46 @@ async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
     except Exception:
         pass
 
+async def _clear_sticky_id(uid: int, context: ContextTypes.DEFAULT_TYPE):
+    """Czyści nieaktualne sticky_id z pamięci trwałej i RAM."""
+    context.user_data.pop("sticky_id", None)
+    st = load_user_state(uid) or {}
+    st.pop("sticky_id", None)
+    save_user_state(uid, st)
+
 async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
-    """Edytuje istniejący panel; gdy edycja nie przejdzie – wysyła nowy i zapamiętuje sticky_id."""
+    """Edycja istniejącego panelu. Gdy to niemożliwe (stare sticky), czyści id i wysyła nowy."""
     chat = update_or_ctx.effective_chat if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.message.chat
     chat_id = chat.id
+    uid = (update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.from_user.id)
     sticky_id = context.user_data.get("sticky_id")
-    can_send_new = True
     if sticky_id:
         try:
             await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=sticky_id,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
+                chat_id=chat_id, message_id=sticky_id, text=text,
+                reply_markup=reply_markup, disable_web_page_preview=True
             )
             return
         except BadRequest as e:
-            emsg = str(e)
-            logging.info(f"editMessageText failed: {emsg}")
-            if "message is not modified" in emsg.lower():
+            emsg = str(e).lower()
+            logging.info(f"editMessageText failed: {e}")
+            # znane przypadki po „wyczyszczeniu chatu”
+            if any(s in emsg for s in [
+                "message to edit not found",
+                "message can't be edited",
+                "chat not found",
+                "message identifier is not specified",
+            ]):
+                await _clear_sticky_id(uid, context)
+            elif "message is not modified" in emsg:
                 return
-            # na każdy inny BadRequest – spróbuj wysłać nową
-            can_send_new = True
+            # dla innych błędów – spróbuj wysłać nową
         except Exception as e:
             logging.info(f"editMessageText exception: {e}")
-            can_send_new = True
-    if can_send_new:
-        m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
-        context.user_data["sticky_id"] = m.message_id
-        uid = (update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update)
-               else update_or_ctx.callback_query.from_user.id)
-        sync_out(uid, context)
+    # brak/wyczyszczone sticky: wyślij nowy panel i zapisz id
+    m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
+    context.user_data["sticky_id"] = m.message_id
+    sync_out(uid, context)
 
 def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
     aw = context.user_data.get("await") or {}
@@ -349,6 +362,7 @@ def project_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         if tf:
             prev = tf if len(tf) <= 60 else tf[:57] + "…"
             out.append(f"• {st['name']}{ptxt}: 🔧 {prev}")
+    out.append("\n⚠️ Usunięcie inwestycji jest nieodwracalne.")
     return "\n".join(out)
 
 def project_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
@@ -362,6 +376,7 @@ def project_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup
         [InlineKeyboardButton("Prace dodatkowe", callback_data="stage:open:S7")],
         [InlineKeyboardButton("✅ Oznacz zakończoną", callback_data="proj:finish"),
          InlineKeyboardButton("📦 Archiwizuj/Przywróć", callback_data="proj:toggle_active")],
+        [InlineKeyboardButton("🗑 Usuń inwestycję", callback_data="proj:delete")],
         [InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -458,9 +473,8 @@ async def render_stage(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────── Handlers ────────────────────
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = sync_in(update, context)
-    sid = context.user_data.get("sticky_id")
+    # ⬇⬇⬇ NIE przenosimy sticky_id po /start — zawsze od świeżej wiadomości
     context.user_data.clear()
-    if sid: context.user_data["sticky_id"] = sid
     context.user_data["date"] = today_str()
     sync_out(uid, context)
     await render_home(update, context)
@@ -472,7 +486,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /start – lista inwestycji, dodawanie, archiwum.\n"
         "• W projekcie → Etap → edytuj pola. Zmiany zapisują się do SQLite i od razu je widać w panelu.\n"
         "• Kropki ○/● pokazują, że czekam na tekst/zdjęcie.\n"
-        "• Stan sesji (w tym sticky_id) jest trwały.\n"
+        "• Sticky panel sam się naprawia po wyczyszczeniu chatu.\n"
     )
     await sticky_set(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")]]))
 
@@ -494,14 +508,17 @@ async def calendar_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_home(update, context); return ConversationHandler.END
     sync_out(uid, context); return DATE_PICK
 
-# --- projekty / archiwum ---
+# --- projekty / archiwum (wraz z usuwaniem) ---
 def _render_archive_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     projs = list_projects(active_only=False)
     context.user_data["arch_names"] = [p["name"] for p in projs]
     rows = []
     for i, p in enumerate(projs):
         state = "🟢" if p["active"] else "⚪️"
-        rows.append([InlineKeyboardButton(f"{state} {p['name']}", callback_data=f"arch:tog:{i}")])
+        rows.append([
+            InlineKeyboardButton(f"{state} {p['name']}", callback_data=f"arch:tog:{i}"),
+            InlineKeyboardButton("🗑", callback_data=f"arch:del:{i}")
+        ])
     rows.append([InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -516,7 +533,7 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_home(update, context); return
 
     if data == "proj:arch":
-        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
+        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij, aby przełączyć lub usuń 🗑):", _render_archive_kb(context)); sync_out(uid, context); return
 
     if data.startswith("arch:tog:"):
         idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
@@ -524,7 +541,31 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             allp = {p["name"]: p for p in list_projects(active_only=False)}
             cur = allp.get(names[idx])
             if cur: set_project_active(names[idx], not cur["active"])
-        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
+        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij, aby przełączyć lub usuń 🗑):", _render_archive_kb(context)); sync_out(uid, context); return
+
+    if data.startswith("arch:del:"):
+        idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
+        name = names[idx] if 0 <= idx < len(names) else None
+        if not name:
+            await sticky_set(update, context, "❗️ Nie znaleziono pozycji archiwum.", _render_archive_kb(context)); sync_out(uid, context); return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Usuń", callback_data=f"arch:delyes:{idx}"),
+             InlineKeyboardButton("Anuluj", callback_data="arch:delno")]
+        ])
+        await sticky_set(update, context, f"❗️ Potwierdź usunięcie inwestycji „{name}”. Tej operacji nie da się cofnąć.", kb); sync_out(uid, context); return
+
+    if data.startswith("arch:delyes:"):
+        idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
+        name = names[idx] if 0 <= idx < len(names) else None
+        if name:
+            delete_project(name)
+            if context.user_data.get("project") == name:
+                for k in ("project", "stage_code", "await"):
+                    context.user_data.pop(k, None)
+        await sticky_set(update, context, "✅ Usunięto. Wybierz kolejne:", _render_archive_kb(context)); sync_out(uid, context); return
+
+    if data == "arch:delno":
+        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij, aby przełączyć lub usuń 🗑):", _render_archive_kb(context)); sync_out(uid, context); return
 
     if data.startswith("proj:open:"):
         idx = int(data.split(":")[2]); projs = list_projects(active_only=True)
@@ -549,6 +590,27 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = allp.get(proj)
             if cur: set_project_active(proj, not cur["active"])
         sync_out(uid, context); await render_home(update, context); return
+
+    if data == "proj:delete":
+        proj = context.user_data.get("project")
+        if not proj:
+            await render_home(update, context); return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Usuń", callback_data="proj:delyes"),
+             InlineKeyboardButton("Anuluj", callback_data="proj:delno")]
+        ])
+        await sticky_set(update, context, f"❗️ Potwierdź usunięcie inwestycji „{proj}”. Tej operacji nie da się cofnąć.", kb); sync_out(uid, context); return
+
+    if data == "proj:delyes":
+        name = context.user_data.get("project")
+        if name:
+            delete_project(name)
+            for k in ("project", "stage_code", "await"):
+                context.user_data.pop(k, None)
+        await sticky_set(update, context, "✅ Inwestycję usunięto.", projects_menu_kb(context)); sync_out(uid, context); await render_home(update, context); return
+
+    if data == "proj:delno":
+        await render_project(update, context); sync_out(uid, context); return
 
 # --- panel etapu ---
 async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -717,8 +779,11 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(date_open_cb, pattern=r"^date:open$"))
     app.add_handler(CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$"))
 
-    # projekty / archiwum
-    app.add_handler(CallbackQueryHandler(projects_router, pattern=r"^(nav:home|proj:add|proj:arch|arch:tog:\d+|proj:open:\d+|proj:finish|proj:toggle_active)$"))
+    # projekty / archiwum / usuwanie
+    app.add_handler(CallbackQueryHandler(
+        projects_router,
+        pattern=r"^(nav:home|proj:add|proj:arch|arch:tog:\d+|arch:del:\d+|arch:delyes:\d+|arch:delno|proj:open:\d+|proj:finish|proj:toggle_active|proj:delete|proj:delyes|proj:delno)$"
+    ))
 
     # panel etapu + procenty
     app.add_handler(CallbackQueryHandler(stage_router, pattern=r"^(stage:open:S[1-7]|stage:set:(todo|notes)|stage:set:percent:S[1-7]|stage:clear:(todo|notes):S[1-7]|stage:save:S[1-7]|proj:back|stage:add_photo)$"))
@@ -738,6 +803,13 @@ if __name__ == "__main__":
         raise SystemExit("Brak TELEGRAM_TOKEN w env.")
     bot_app = build_app()
     if WEBHOOK_URL:
-        bot_app.run_webhook(listen="0.0.0.0", port=PORT, url_path=TELEGRAM_TOKEN, webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+        bot_app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
     else:
         bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
