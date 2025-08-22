@@ -1,13 +1,11 @@
-# ────────────────────────── etapy_bot.py (2025-08) ──────────────────────────
+# ────────────────────────── etapy_bot.py (2025-08, dots ○/● for active text/photo) ──────────────────────────
 # Panel jak BotFather (jedna wiadomość), zarządzanie etapami inwestycji.
 # • /start → lista inwestycji (wspólna dla zespołu) + dodanie nowej
-# • Każda inwestycja ma stałe etapy: Etap 1..Etap 6, Prace dodatkowe
-# • W etapie: "Do dokończenia", "Notatki", "% ukończenia", "Zdjęcia", "💾 Zapisz"
+# • Stałe etapy: Etap 1..Etap 6, Prace dodatkowe
+# • W etapie: "Do dokończenia", "Notatki", "%", "Zdjęcia", "💾 Zapisz"
 # • Dane trwałe w Excelu (DATA_DIR/projects.xlsx)
-# • Arkusz "__Projects" (lista inwestycji, aktywność, zakończenie)
-# • Arkusze per inwestycja z wierszami etapów (bez JSON-ów)
-# • Single-message UI: sticky + back; aktywne wejście tekstowe oznaczane (●)
-# • Brak eksportów (zgodnie z wymaganiem)
+# • Arkusz "__Projects" (lista inwestycji), arkusze per inwestycja (wiersze etapów)
+# • Single-message UI: sticky + back; aktywne wejście oznaczone kropką ●, nieaktywne ○
 
 import os
 import re
@@ -34,7 +32,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
-    InputFile,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -320,8 +317,15 @@ def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
     field = aw.get("field")
     proj = context.user_data.get("project", "")
     stage = context.user_data.get("stage", "")
-    name_map = {"todo": "Do dokończenia", "notes": "Notatki", "photo": "Zdjęcie"}
-    return f"✍️ *Oczekuję na:* {name_map.get(field, field)} (inwestycja: {proj} | {stage}). Wyślij teraz.\n"
+    name_map = {
+        "project_name": "Nazwa inwestycji",
+        "todo": "Do dokończenia",
+        "notes": "Notatki",
+        "percent": "% ukończenia",
+        "photo": "Zdjęcie",
+    }
+    where = f" (inwestycja: {proj} | {stage})" if proj and stage else ""
+    return f"✍️ *Oczekuję na:* {name_map.get(field, field)}{where}. Wyślij teraz.\n"
 
 def projects_menu_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     ds = context.user_data.get("date", today_str())
@@ -337,10 +341,14 @@ def projects_menu_text(context: ContextTypes.DEFAULT_TYPE) -> str:
 def projects_menu_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     ds = context.user_data.get("date", today_str())
     projs = list_projects(active_only=True)
+    aw = context.user_data.get("await") or {}
+    add_active = (aw.get("mode") == "text" and aw.get("field") == "project_name")
+    def mark(label, active):  # ○/●
+        return f"{'●' if active else '○'} {label}"
     rows = [[InlineKeyboardButton(f"📅 Data: {ds}", callback_data="date:open")]]
     for i, p in enumerate(projs):
         rows.append([InlineKeyboardButton(f"🏗️ {p['name']}", callback_data=f"proj:open:{i}")])
-    rows.append([InlineKeyboardButton("➕ Dodaj inwestycję", callback_data="proj:add")])
+    rows.append([InlineKeyboardButton(mark("➕ Dodaj inwestycję", add_active), callback_data="proj:add")])
     rows.append([InlineKeyboardButton("🗄 Archiwum", callback_data="proj:arch")])
     return InlineKeyboardMarkup(rows)
 
@@ -349,19 +357,17 @@ def project_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     b = banner_await(context)
     lines = []
     if b: lines.append(b)
-    # Krótki podgląd otwartych "Do dokończenia" z etapów
     lines.append(f"🏗️ *{proj}*")
     lines.append("👇 Wybierz etap. Otwarte zadania:")
     for st in STAGES:
         stdata = read_stage(proj, st)
-        tf = stdata["ToFinish"].strip()
+        tf = (stdata["ToFinish"] or "").strip()
         if tf:
             preview = tf if len(tf) <= 60 else tf[:57] + "…"
             lines.append(f"• {st}: 🔧 {preview}")
     return "\n".join(lines)
 
 def project_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
-    proj = context.user_data.get("project")
     rows = [
         [InlineKeyboardButton("Etap 1", callback_data="stage:Etap 1"),
          InlineKeyboardButton("Etap 2", callback_data="stage:Etap 2")],
@@ -398,14 +404,22 @@ def stage_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def stage_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     aw = context.user_data.get("await") or {}
-    field_active = aw.get("field") if aw.get("mode") == "text" else None
-    def mark(label, key):  # dodaje ● przy aktywnym polu
-        return f"{'● ' if field_active == key else ''}{label}"
+    # aktywne pola: tekstowe (todo/notes/percent-manual) i foto
+    active_key = None
+    if aw:
+        if aw.get("mode") == "text" and aw.get("field") in {"todo", "notes", "percent"}:
+            active_key = aw.get("field")
+        if aw.get("mode") == "photo":
+            active_key = "photo"
+
+    def mark(label, key):  # ○/●
+        return f"{'●' if active_key == key else '○'} {label}"
+
     rows = [
         [InlineKeyboardButton(mark("🔧 Do dokończenia", "todo"), callback_data="stage:set:todo"),
          InlineKeyboardButton(mark("📝 Notatki", "notes"), callback_data="stage:set:notes")],
-        [InlineKeyboardButton("📊 % (0/25/50/75/90/100)", callback_data="stage:set:percent"),
-         InlineKeyboardButton("📸 Dodaj zdjęcie", callback_data="stage:add_photo")],
+        [InlineKeyboardButton(mark("📊 % (0/25/50/75/90/100)", "percent"), callback_data="stage:set:percent"),
+         InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
         [InlineKeyboardButton("🧹 Wyczyść Do dokończenia", callback_data="stage:clear:todo"),
          InlineKeyboardButton("🧹 Wyczyść Notatki", callback_data="stage:clear:notes")],
         [InlineKeyboardButton("💾 Zapisz zmiany", callback_data="stage:save")],
@@ -447,8 +461,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Pomoc – Inwestycje*\n"
         "• /start – lista inwestycji (wspólna), dodanie nowej.\n"
         "• Panel → wybierz inwestycję → etap → edytuj pola.\n"
-        "• Pola tekstowe: po wciśnięciu przycisku wyślij wiadomość; zostanie skasowana i zapisana.\n"
-        "• Zdjęcia: wybierz „Dodaj zdjęcie”, potem prześlij foto – zapiszę `file_id` (bez pobierania pliku).\n"
+        "• Pola tekstowe/foto: po wciśnięciu przycisku pojawia się ● przy danym przycisku i baner „✍️ Oczekuję…”.\n"
+        "• Zdjęcia: wybierz „📸 Dodaj zdjęcie”, potem prześlij foto — zapiszę `file_id` (bez pobierania).\n"
         "• Wszystko zapisuje się w Excelu (`projects.xlsx`) per inwestycja.\n"
     )
     await sticky_set(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")]]))
@@ -492,7 +506,6 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "proj:arch":
-        # pokaz aktywne/archiwum przełączalnie
         projs_all = list_projects(active_only=False)
         kb = []
         for p in projs_all:
@@ -504,7 +517,6 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("proj:toggle:"):
         name = data.split(":", 2)[2]
-        # przełącz aktywność
         current = {p["name"]: p for p in list_projects(active_only=False)}.get(name)
         if current:
             archive_project(name, active=not current["active"])
@@ -566,6 +578,7 @@ async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await render_stage(update, context)
                 return
             if action == "percent":
+                # pokaż szybkie wartości + możliwość „wpisz ręcznie”
                 await sticky_set(update, context, "📊 Ustaw % ukończenia:", percent_kb())
                 return
         elif parts[1] == "clear":
@@ -575,7 +588,6 @@ async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render_stage(update, context)
             return
         elif parts[1] == "save":
-            # nic buforowanego — aktualizacje są natychmiastowe po tekście/wyborze; tu tylko feedback
             await safe_answer(q, text="Zapisano. ✅")
             await render_stage(update, context)
             return
@@ -632,7 +644,6 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = aw.get("mode")
     field = aw.get("field")
     if mode != "text":
-        # ignoruj nieoczekiwane teksty
         return
 
     # dodawanie projektu
@@ -688,14 +699,11 @@ async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-    # zapisz file_id w Photos (spacja-sep)
     data = read_stage(proj, st)
     photos = (data["Photos"] or "").split()
     photos.append(file_id)
-    # limit pamięci — np. 200 fotek na etap
     photos = photos[-200:]
     update_stage(proj, st, {"Photos": " ".join(photos)}, update.effective_user.first_name, update.effective_user.id)
-    # usuń wiadomość użytkownika
     try:
         await update.message.delete()
     except Exception:
