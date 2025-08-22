@@ -1,9 +1,9 @@
-# ────────────────────────── etapy_bot.py (2025-08 • FIX: trwały stan + stabilne zapisy tekstu) ──────────────────────────
-# Single-message UI jak BotFather. Stabilne działanie na webhooku / wielu replikach:
-# - Stan per użytkownik trzymany trwale w /data/state/<uid>.json (project, stage_code, await, date)
-# - Callbacki %/clear/save niosą kod etapu (S1..S7) → brak zależności od user_data
-# - Każda zmiana zapisuje do Excela i od razu renderuje widok z odczytu
-# - Nazwy arkuszy Excela sanityzowane (usuwamy niedozwolone znaki, max 31)
+# ────────────────────────── etapy_bot.py (2025-08 • FIX: brak duplikatów panelu + stabilne % i zapisy) ──────────────────────────
+# Single-message UI jak BotFather. Stabilne na webhooku/wielu replikach:
+# - Stan per user w /data/state/<uid>.json (project, stage_code, await, date)
+# - Callbacki niosą stage_code (S1..S7) → brak zależności od ulotnego user_data
+# - Każda zmiana zapisuje do Excela i renderuje widok; jeśli treść się nie zmieni, NIE tworzymy nowej wiadomości
+# - Nazwy arkuszy Excela sanityzowane (max 31, bez : \ / ? * [ ])
 
 import os
 import re
@@ -51,7 +51,6 @@ os.makedirs(STATE_DIR, exist_ok=True)
 PROJECTS_SHEET = "__Projects"
 PROJECTS_HEADERS = ["Project", "Active", "Finished", "CreatedAt"]
 
-# Stałe etapy
 STAGES = [
     {"code": "S1", "name": "Etap 1"},
     {"code": "S2", "name": "Etap 2"},
@@ -71,7 +70,7 @@ STAGE_HEADERS = [
 
 DATE_PICK = 10
 
-# ──────────────────── helpers: czas, IO ────────────────────
+# ──────────────────── helpers ────────────────────
 def today_str() -> str: return datetime.now().strftime("%d.%m.%Y")
 def to_ddmmyyyy(d: date) -> str: return d.strftime("%d.%m.%Y")
 
@@ -89,7 +88,7 @@ def _with_lock(fn, *args, **kwargs):
     with portalocker.Lock(LOCK_FILE, timeout=30):
         return fn(*args, **kwargs)
 
-# ──────────────────── trwały stan użytkownika ────────────────────
+# ──────────────────── stan użytkownika (trwały) ────────────────────
 def _state_path(uid: int) -> str:
     return os.path.join(STATE_DIR, f"{uid}.json")
 
@@ -113,7 +112,6 @@ def sync_in(update_or_ctx, context: ContextTypes.DEFAULT_TYPE) -> int:
            else update_or_ctx.callback_query.from_user.id)
     state = load_user_state(uid)
     if state:
-        # nie kasuj istniejących kluczy – nadpisz tylko stanowe
         for k in ["date", "project", "stage_code", "await"]:
             if k in state:
                 context.user_data[k] = state[k]
@@ -121,14 +119,13 @@ def sync_in(update_or_ctx, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 def sync_out(uid: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = {}
-    for k in ["date", "project", "stage_code", "await"]:
+    for k in ["date", "project", "stage_code", "await", "sticky_id"]:
         if k in context.user_data:
             data[k] = context.user_data[k]
     save_user_state(uid, data)
 
-# ──────────────────── Excel: sanityzacja nazw arkuszy ────────────────────
+# ──────────────────── Excel ────────────────────
 def _sheet_title(project_name: str) -> str:
-    # Excel: max 31 znaków, bez: : \ / ? * [ ]
     bad = set(':\/?*[]')
     title = "".join(('·' if ch in bad else ch) for ch in project_name)
     title = title[:31] if len(title) > 31 else title
@@ -138,9 +135,7 @@ def open_wb() -> Workbook:
     if os.path.exists(EXCEL_FILE):
         return load_workbook(EXCEL_FILE)
     wb = Workbook()
-    ws = wb.active
-    ws.title = PROJECTS_SHEET
-    ws.append(PROJECTS_HEADERS)
+    ws = wb.active; ws.title = PROJECTS_SHEET; ws.append(PROJECTS_HEADERS)
     _atomic_save_wb(wb, EXCEL_FILE)
     return wb
 
@@ -164,8 +159,7 @@ def list_projects(active_only: bool = True) -> List[Dict[str, str]]:
                 "finished": (str(row[2]).lower() == "true"),
                 "created": row[3],
             }
-            if not active_only or prj["active"]:
-                out.append(prj)
+            if not active_only or prj["active"]: out.append(prj)
         return out
     return _with_lock(_read)
 
@@ -228,7 +222,6 @@ def read_stage(project: str, stage_name: str) -> Dict[str, str]:
                     "LastEditor": row[idx["LastEditor"]] or "",
                     "LastEditorId": row[idx["LastEditorId"]] or "",
                 }
-        # brak wiersza → dołóż
         ws2 = ensure_project_sheet(project); ws2.append([stage_name, "", "", "", "-", "", "", "", ""])
         _atomic_save_wb(ws2.parent, EXCEL_FILE)
         return {"Stage": stage_name, "Percent": "", "ToFinish": "", "Notes": "", "Finished": "-", "LastUpdated": "", "Photos": "", "LastEditor": "", "LastEditorId": ""}
@@ -249,7 +242,8 @@ def update_stage(project: str, stage_name: str, updates: Dict[str, str], editor_
             target_row = ws.max_row + 1; ws.append([stage_name] + [""]*(len(headers)-1))
         for k, v in updates.items():
             ws.cell(target_row, hidx[k], v)
-        ws.cell(target_row, hidx["LastUpdated"], datetime.now().strftime("%d.%m.%Y %H:%M"))
+        # Dodaj sekundy, by łatwiej różnicować treść panelu
+        ws.cell(target_row, hidx["LastUpdated"], datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
         ws.cell(target_row, hidx["LastEditor"], editor_name)
         ws.cell(target_row, hidx["LastEditorId"], str(editor_id))
         _atomic_save_wb(wb, EXCEL_FILE)
@@ -260,23 +254,49 @@ async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
     try:
         if text is not None: await q.answer(text=text, show_alert=show_alert)
         else: await q.answer()
-    except BadRequest: pass
-    except Exception: pass
+    except BadRequest:
+        pass
+    except Exception:
+        pass
 
 async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+    """Edytuje istniejący panel; jeśli identyczny – NIC nie robi; nową wiadomość wysyła tylko gdy nie ma sticky_id albo
+    gdy edycja jest niemożliwa (np. 'message to edit not found')."""
     chat = update_or_ctx.effective_chat if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.message.chat
     chat_id = chat.id
     sticky_id = context.user_data.get("sticky_id")
-    try:
-        if sticky_id:
+    if sticky_id:
+        try:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=sticky_id, text=text,
                 reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True
-            ); return
-    except Exception:
-        pass
+            )
+            return
+        except BadRequest as e:
+            msg = str(e).lower()
+            # NIE twórz nowej wiadomości, jeśli treść się nie zmieniła
+            if "message is not modified" in msg:
+                return
+            # Jeśli edycja niemożliwa (skasowane itp.) – przejdź do wysłania nowej
+            if not any(s in msg for s in [
+                "message to edit not found",
+                "message identifier is not specified",
+                "chat not found",
+                "message can't be edited",
+            ]):
+                # Inne błędy – też nie duplikuj panelu
+                return
+        except Exception:
+            # Nie duplikuj przy nieznanym błędzie
+            return
+    # Brak sticky_id albo poprzednia wiadomość nie istnieje → wyślij nową i zapamiętaj id
     m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
     context.user_data["sticky_id"] = m.message_id
+    # zapisz sticky_id trwale (przydatne przy replikach)
+    uid = update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.from_user.id
+    save_user_state(uid, {**load_user_state(uid), "sticky_id": m.message_id, "date": context.user_data.get("date"),
+                          "project": context.user_data.get("project"), "stage_code": context.user_data.get("stage_code"),
+                          "await": context.user_data.get("await")})
 
 def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
     aw = context.user_data.get("await") or {}
@@ -393,7 +413,7 @@ def stage_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(mark("🔧 Do dokończenia", "todo"), callback_data="stage:set:todo"),
          InlineKeyboardButton(mark("📝 Notatki", "notes"), callback_data="stage:set:notes")],
         [InlineKeyboardButton(mark("📊 % (0/25/50/75/90/100)", "percent"), callback_data=f"stage:set:percent:{scode}"),
-         InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
+            InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
         [InlineKeyboardButton("🧹 Wyczyść Do dokończenia", callback_data=f"stage:clear:todo:{scode}"),
          InlineKeyboardButton("🧹 Wyczyść Notatki", callback_data=f"stage:clear:notes:{scode}")],
         [InlineKeyboardButton("💾 Zapisz zmiany", callback_data=f"stage:save:{scode}")],
@@ -547,14 +567,12 @@ async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = sync_in(update, context); q = update.callback_query; await safe_answer(q); data = q.data
     proj = context.user_data.get("project")
 
-    # wybór etapu
     if data.startswith("stage:open:"):
         scode = data.split(":")[2]
         if scode not in CODE2NAME: sync_out(uid, context); await render_project(update, context); return
         context.user_data["stage_code"] = scode; context.user_data.pop("await", None); sync_out(uid, context)
         await render_stage(update, context); return
 
-    # ustawienia pól (tekst)
     if data == "stage:set:todo":
         context.user_data["await"] = {"mode": "text", "field": "todo"}; sync_out(uid, context)
         await render_stage(update, context); return
@@ -562,12 +580,10 @@ async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await"] = {"mode": "text", "field": "notes"}; sync_out(uid, context)
         await render_stage(update, context); return
 
-    # procenty – z kodem etapu
     if data.startswith("stage:set:percent:"):
         scode = data.split(":")[3]
         await sticky_set(update, context, "📊 Ustaw % ukończenia:", percent_kb(scode)); sync_out(uid, context); return
 
-    # czyszczenie pól – z kodem
     if data.startswith("stage:clear:"):
         _, _, field, scode = data.split(":")
         sname = CODE2NAME.get(scode, "")
@@ -575,7 +591,6 @@ async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_stage(proj, sname, {"ToFinish" if field == "todo" else "Notes": ""}, q.from_user.first_name, q.from_user.id)
         await safe_answer(q, "Wyczyszczono ✅"); sync_out(uid, context); await render_stage(update, context); return
 
-    # zapis meta – z kodem
     if data.startswith("stage:save:"):
         scode = data.split(":")[2]; sname = CODE2NAME.get(scode, "")
         if proj and sname:
@@ -589,7 +604,7 @@ async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await"] = {"mode": "photo", "field": "photo"}; sync_out(uid, context)
         await render_stage(update, context); return
 
-# --- procenty: szybkie i ręczne (callback niesie S-code) ---
+# --- procenty ---
 async def percent_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = sync_in(update, context); q = update.callback_query; await safe_answer(q)
     data = q.data
@@ -599,21 +614,23 @@ async def percent_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sync_out(uid, context); await render_stage(update, context); return
 
     if data.startswith("pct:"):
-        _, scode, val = data.split(":")
+        try:
+            _, scode, val = data.split(":")
+        except ValueError:
+            return
         sname = CODE2NAME.get(scode, "")
         if val == "manual":
             context.user_data["await"] = {"mode": "text", "field": "percent"}; context.user_data["stage_code"] = scode; sync_out(uid, context)
             await render_stage(update, context); return
-        try:
-            pct = int(val)
-        except Exception:
-            pct = None
+        pct = None
+        try: pct = int(val)
+        except Exception: pass
         if proj and sname and pct is not None:
             update_stage(proj, sname, {"Percent": pct}, q.from_user.first_name, q.from_user.id)
             await safe_answer(q, "Ustawiono % ✅")
         sync_out(uid, context); await render_stage(update, context); return
 
-# --- wejścia tekstowe (trwały stan użyty do rozstrzygnięcia kontekstu) ---
+# --- tekstowe wejścia ---
 async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = sync_in(update, context)
     txt = (update.message.text or "").strip()
@@ -623,13 +640,11 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     aw = context.user_data.get("await") or {}
     mode = aw.get("mode"); field = aw.get("field")
 
-    # dodawanie inwestycji
     if mode == "text" and field == "project_name":
         if txt: add_project(txt)
         context.user_data.pop("await", None); sync_out(uid, context)
         await render_home(update, context); return
 
-    # edycja etapu
     if mode != "text":
         sync_out(uid, context); return
 
@@ -682,7 +697,8 @@ async def photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- cancel / errors ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await context.bot.delete_message(update.effective_chat.id, context.user_data.get("sticky_id"))
+        if context.user_data.get("sticky_id"):
+            await context.bot.delete_message(update.effective_chat.id, context.user_data.get("sticky_id"))
     except Exception:
         pass
     await update.effective_chat.send_message("Anulowano.")
@@ -708,19 +724,14 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # data
     app.add_handler(CallbackQueryHandler(date_open_cb, pattern=r"^date:open$"))
     app.add_handler(CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$"))
 
-    # projekty / archiwum
     app.add_handler(CallbackQueryHandler(projects_router, pattern=r"^(nav:home|proj:add|proj:arch|arch:tog:\d+|proj:open:\d+|proj:finish|proj:toggle_active)$"))
 
-    # panel etapu + procenty
     app.add_handler(CallbackQueryHandler(stage_router, pattern=r"^(stage:open:S[1-7]|stage:set:(todo|notes)|stage:set:percent:S[1-7]|stage:clear:(todo|notes):S[1-7]|stage:save:S[1-7]|proj:back|stage:add_photo)$"))
-    # 🔧 FIX REGEX: użyj (\d+|manual), nie (\\d+|manual)
     app.add_handler(CallbackQueryHandler(percent_cb, pattern=r"^(pct:(S[1-7]):(\d+|manual)|pct:back)$"))
 
-    # wejścia
     app.add_handler(MessageHandler(filters.PHOTO, photo_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
 
