@@ -1,27 +1,21 @@
-# ────────────────────────── etapy_bot.py (2025-08 • FIX v2: sticky_id sync + pct regex + stabilne renderowanie) ──────────────────────────
-# Single-message UI jak BotFather. Stabilne na webhooku / wielu replikach:
-# - Stan per user w /data/state/<uid>.json (date, project, stage_code, await, sticky_id)
-# - Callbacki niosą stage_code (S1..S7) → brak zależności od ulotnego user_data
-# - Każda zmiana zapisuje do Excela i renderuje widok; nie duplikujemy panelu
-# - Nazwy arkuszy Excela sanityzowane (max 31, bez : \ / ? * [ ])
+# ────────────────────────── etapy_bot.py (2025-08 • Storage: SQLite, stable sticky UI) ──────────────────────────
+# Single-message UI jak BotFather. Stabilne na webhooku:
+# • Trwały stan per user w /data/state/<uid>.json (date, project, stage_code, await, sticky_id)
+# • Dane biznesowe w SQLite: /data/invest.db (projects, stages)
+# • Callbacki niosą stage_code (S1..S7) → brak zależności od ulotnego user_data
+# • Każda zmiana zapisuje do DB i od razu renderuje widok. Bez duplikowania wiadomości.
+# • Zdjęcia: przechowujemy telegramowe file_id rozdzielone spacją (max ~200/sesję)
 
 import os
 import re
 import json
+import sqlite3
 import logging
 import calendar as cal
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
-from openpyxl import Workbook, load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
-
-try:
-    from office365.sharepoint.client_context import ClientContext
-    from office365.runtime.auth.client_credential import ClientCredential
-except ModuleNotFoundError:
-    ClientContext = ClientCredential = None
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
@@ -32,25 +26,21 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 
-import tempfile
-import portalocker
-
 # ──────────────────── konfiguracja ────────────────────
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+if WEBHOOK_URL and not WEBHOOK_URL.startswith("http"):
+    WEBHOOK_URL = "https://" + WEBHOOK_URL
 PORT = int(os.getenv("PORT", 8080))
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-EXCEL_FILE = os.path.join(DATA_DIR, "projects.xlsx")
-LOCK_FILE = os.path.join(DATA_DIR, "projects.lock")
+DB_FILE = os.path.join(DATA_DIR, "invest.db")
 STATE_DIR = os.path.join(DATA_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 
-PROJECTS_SHEET = "__Projects"
-PROJECTS_HEADERS = ["Project", "Active", "Finished", "CreatedAt"]
-
+# Stałe etapy
 STAGES = [
     {"code": "S1", "name": "Etap 1"},
     {"code": "S2", "name": "Etap 2"},
@@ -63,32 +53,12 @@ STAGES = [
 CODE2NAME = {x["code"]: x["name"] for x in STAGES}
 NAME2CODE = {x["name"]: x["code"] for x in STAGES}
 
-STAGE_HEADERS = [
-    "Stage", "Percent", "ToFinish", "Notes", "Finished",
-    "LastUpdated", "Photos", "LastEditor", "LastEditorId",
-]
-
 DATE_PICK = 10
 
-# ──────────────────── helpers ────────────────────
+# ──────────────────── helpers: czas, stan ────────────────────
 def today_str() -> str: return datetime.now().strftime("%d.%m.%Y")
 def to_ddmmyyyy(d: date) -> str: return d.strftime("%d.%m.%Y")
 
-def _atomic_save_wb(wb: Workbook, path: str) -> None:
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp"); os.close(fd)
-    wb.save(tmp_path); os.replace(tmp_path, path)
-
-def _atomic_save_json(path: str, obj: dict) -> None:
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp"); os.close(fd)
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp_path, path)
-
-def _with_lock(fn, *args, **kwargs):
-    with portalocker.Lock(LOCK_FILE, timeout=30):
-        return fn(*args, **kwargs)
-
-# ──────────────────── stan użytkownika (trwały) ────────────────────
 def _state_path(uid: int) -> str:
     return os.path.join(STATE_DIR, f"{uid}.json")
 
@@ -102,17 +72,16 @@ def load_user_state(uid: int) -> dict:
         return {}
 
 def save_user_state(uid: int, data: dict) -> None:
-    try:
-        _atomic_save_json(_state_path(uid), data)
-    except Exception:
-        pass
+    tmp = _state_path(uid) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, _state_path(uid))
 
 def sync_in(update_or_ctx, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = (update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update)
            else update_or_ctx.callback_query.from_user.id)
     state = load_user_state(uid)
     if state:
-        # ⬇⬇⬇ WAŻNE: załaduj też sticky_id
         for k in ["date", "project", "stage_code", "await", "sticky_id"]:
             if k in state:
                 context.user_data[k] = state[k]
@@ -125,129 +94,198 @@ def sync_out(uid: int, context: ContextTypes.DEFAULT_TYPE) -> None:
             data[k] = context.user_data[k]
     save_user_state(uid, data)
 
-# ──────────────────── Excel ────────────────────
-def _sheet_title(project_name: str) -> str:
-    bad = set(':\/?*[]')
-    title = "".join(('·' if ch in bad else ch) for ch in project_name)
-    title = title[:31] if len(title) > 31 else title
-    return title or "Projekt"
+# ──────────────────── SQLite ────────────────────
+def _conn():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
 
-def open_wb() -> Workbook:
-    if os.path.exists(EXCEL_FILE):
-        return load_workbook(EXCEL_FILE)
-    wb = Workbook()
-    ws = wb.active; ws.title = PROJECTS_SHEET; ws.append(PROJECTS_HEADERS)
-    _atomic_save_wb(wb, EXCEL_FILE)
-    return wb
-
-def ensure_projects_sheet(wb: Workbook) -> Worksheet:
-    if PROJECTS_SHEET not in wb.sheetnames:
-        ws = wb.create_sheet(PROJECTS_SHEET, index=0); ws.append(PROJECTS_HEADERS)
-    else:
-        ws = wb[PROJECTS_SHEET]
-        if ws.max_row < 1: ws.append(PROJECTS_HEADERS)
-    return ws
+def init_db():
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        finished INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS stages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        code TEXT NOT NULL,
+        name TEXT NOT NULL,
+        percent INTEGER,            -- NULL → brak
+        to_finish TEXT,             -- "Do dokończenia"
+        notes TEXT,                 -- "Notatki"
+        finished TEXT,              -- "-" / "✓" (opcjonalnie)
+        last_updated TEXT,
+        photos TEXT,                -- "fileid fileid ..."
+        last_editor TEXT,
+        last_editor_id TEXT,
+        UNIQUE(project_id, code)
+    );
+    """)
+    conn.commit()
+    conn.close()
 
 def list_projects(active_only: bool = True) -> List[Dict[str, str]]:
-    def _read():
-        wb = open_wb(); ws = ensure_projects_sheet(wb)
-        out = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]: continue
-            prj = {
-                "name": row[0],
-                "active": (str(row[1]).lower() != "false"),
-                "finished": (str(row[2]).lower() == "true"),
-                "created": row[3],
-            }
-            if not active_only or prj["active"]: out.append(prj)
-        return out
-    return _with_lock(_read)
+    conn = _conn(); cur = conn.cursor()
+    if active_only:
+        cur.execute("SELECT name, active, finished, created_at FROM projects WHERE active=1 ORDER BY created_at ASC;")
+    else:
+        cur.execute("SELECT name, active, finished, created_at FROM projects ORDER BY active DESC, created_at ASC;")
+    out = []
+    for r in cur.fetchall():
+        out.append({
+            "name": r["name"],
+            "active": bool(r["active"]),
+            "finished": bool(r["finished"]),
+            "created": r["created_at"],
+        })
+    conn.close()
+    return out
+
+def _get_project_id(name: str) -> Optional[int]:
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM projects WHERE name=?;", (name,))
+    row = cur.fetchone()
+    conn.close()
+    return row["id"] if row else None
+
+def _ensure_default_stages(pid: int):
+    # Dodaj S1..S7 jeśli brak
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("SELECT code FROM stages WHERE project_id=?;", (pid,))
+    have = {r["code"] for r in cur.fetchall()}
+    for st in STAGES:
+        if st["code"] not in have:
+            cur.execute("""
+                INSERT INTO stages (project_id, code, name, percent, to_finish, notes, finished, last_updated, photos, last_editor, last_editor_id)
+                VALUES (?, ?, ?, NULL, '', '', '-', '', '', '', '');
+            """, (pid, st["code"], st["name"]))
+    conn.commit(); conn.close()
 
 def add_project(name: str) -> None:
     name = name.strip()
-    if not name: return
-    def _upd():
-        wb = open_wb(); ws = ensure_projects_sheet(wb)
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row and row[0] == name: return
-        ws.append([name, True, False, datetime.now().isoformat()])
-        title = _sheet_title(name)
-        if title not in wb.sheetnames:
-            ws2 = wb.create_sheet(title); ws2.append(STAGE_HEADERS)
-            for st in STAGES: ws2.append([st["name"], "", "", "", "-", "", "", "", ""])
-        _atomic_save_wb(wb, EXCEL_FILE)
-    _with_lock(_upd)
+    if not name:
+        return
+    pid = _get_project_id(name)
+    if pid:
+        return
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("INSERT INTO projects(name, active, finished, created_at) VALUES(?, 1, 0, ?);", (name, datetime.now().isoformat()))
+    conn.commit(); conn.close()
+    pid = _get_project_id(name)
+    if pid:
+        _ensure_default_stages(pid)
 
 def set_project_active(name: str, active: bool) -> None:
-    def _upd():
-        wb = open_wb(); ws = ensure_projects_sheet(wb)
-        for r in range(2, ws.max_row + 1):
-            if ws.cell(r, 1).value == name:
-                ws.cell(r, 2, True if active else False); break
-        _atomic_save_wb(wb, EXCEL_FILE)
-    _with_lock(_upd)
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET active=? WHERE name=?;", (1 if active else 0, name))
+    conn.commit(); conn.close()
 
 def set_project_finished(name: str, finished: bool) -> None:
-    def _upd():
-        wb = open_wb(); ws = ensure_projects_sheet(wb)
-        for r in range(2, ws.max_row + 1):
-            if ws.cell(r, 1).value == name:
-                ws.cell(r, 3, True if finished else False); break
-        _atomic_save_wb(wb, EXCEL_FILE)
-    _with_lock(_upd)
-
-def ensure_project_sheet(name: str) -> Worksheet:
-    wb = open_wb()
-    title = _sheet_title(name)
-    if title not in wb.sheetnames:
-        ws2 = wb.create_sheet(title); ws2.append(STAGE_HEADERS)
-        for st in STAGES: ws2.append([st["name"], "", "", "", "-", "", "", "", ""])
-        _atomic_save_wb(wb, EXCEL_FILE)
-    return wb[title]
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET finished=? WHERE name=?;", (1 if finished else 0, name))
+    conn.commit(); conn.close()
 
 def read_stage(project: str, stage_name: str) -> Dict[str, str]:
-    def _read():
-        ws = ensure_project_sheet(project)
-        headers = [c.value for c in ws[1]]; idx = {h: i for i, h in enumerate(headers)}
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row and row[idx["Stage"]] == stage_name:
-                return {
-                    "Stage": row[idx["Stage"]],
-                    "Percent": row[idx["Percent"]] if row[idx["Percent"]] is not None else "",
-                    "ToFinish": row[idx["ToFinish"]] or "",
-                    "Notes": row[idx["Notes"]] or "",
-                    "Finished": row[idx["Finished"]] or "-",
-                    "LastUpdated": row[idx["LastUpdated"]] or "",
-                    "Photos": row[idx["Photos"]] or "",
-                    "LastEditor": row[idx["LastEditor"]] or "",
-                    "LastEditorId": row[idx["LastEditorId"]] or "",
-                }
-        ws2 = ensure_project_sheet(project); ws2.append([stage_name, "", "", "", "-", "", "", "", ""])
-        _atomic_save_wb(ws2.parent, EXCEL_FILE)
-        return {"Stage": stage_name, "Percent": "", "ToFinish": "", "Notes": "", "Finished": "-", "LastUpdated": "", "Photos": "", "LastEditor": "", "LastEditorId": ""}
-    return _with_lock(_read)
+    pid = _get_project_id(project)
+    if not pid:
+        add_project(project)
+        pid = _get_project_id(project)
+    _ensure_default_stages(pid)
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM stages WHERE project_id=? AND name=?;", (pid, stage_name))
+    r = cur.fetchone()
+    if not r:
+        # fallback – utwórz brakujący etap po nazwie
+        code = NAME2CODE.get(stage_name, "S?")
+        cur.execute("""
+            INSERT INTO stages (project_id, code, name, percent, to_finish, notes, finished, last_updated, photos, last_editor, last_editor_id)
+            VALUES (?, ?, ?, NULL, '', '', '-', '', '', '', '');
+        """, (pid, code, stage_name))
+        conn.commit()
+        cur.execute("SELECT * FROM stages WHERE project_id=? AND name=?;", (pid, stage_name))
+        r = cur.fetchone()
+    conn.close()
+    return {
+        "Stage": r["name"],
+        "Percent": ("" if r["percent"] is None else r["percent"]),
+        "ToFinish": r["to_finish"] or "",
+        "Notes": r["notes"] or "",
+        "Finished": r["finished"] or "-",
+        "LastUpdated": r["last_updated"] or "",
+        "Photos": r["photos"] or "",
+        "LastEditor": r["last_editor"] or "",
+        "LastEditorId": r["last_editor_id"] or "",
+    }
 
 def update_stage(project: str, stage_name: str, updates: Dict[str, str], editor_name: str, editor_id: int) -> None:
-    allowed = set(STAGE_HEADERS) - {"Stage"}
-    for k in updates.keys():
-        if k not in allowed: raise ValueError(f"Unsupported field: {k}")
-    def _upd():
-        wb = open_wb(); ws = ensure_project_sheet(project)
-        headers = [c.value for c in ws[1]]; hidx = {h: i+1 for i, h in enumerate(headers)}
-        target_row = None
-        for r in range(2, ws.max_row + 1):
-            if ws.cell(r, hidx["Stage"]).value == stage_name:
-                target_row = r; break
-        if target_row is None:
-            target_row = ws.max_row + 1; ws.append([stage_name] + [""]*(len(headers)-1))
+    pid = _get_project_id(project)
+    if not pid:
+        add_project(project)
+        pid = _get_project_id(project)
+    _ensure_default_stages(pid)
+    # mapowanie kolumn
+    colmap = {
+        "Percent": "percent",
+        "ToFinish": "to_finish",
+        "Notes": "notes",
+        "Finished": "finished",
+        "LastUpdated": "last_updated",
+        "Photos": "photos",
+        "LastEditor": "last_editor",
+        "LastEditorId": "last_editor_id",
+    }
+    sets = []
+    vals = []
+    for k, v in updates.items():
+        if k not in colmap:
+            raise ValueError(f"Unsupported field: {k}")
+        sets.append(f"{colmap[k]}=?")
+        vals.append(v)
+    # meta
+    sets.extend(["last_updated=?", "last_editor=?", "last_editor_id=?"])
+    vals.extend([datetime.now().strftime("%d.%m.%Y %H:%M:%S"), editor_name or "", str(editor_id or "")])
+    vals.extend([pid, stage_name])
+    sql = f"UPDATE stages SET {', '.join(sets)} WHERE project_id=? AND name=?;"
+    conn = _conn(); cur = conn.cursor()
+    cur.execute(sql, tuple(vals))
+    if cur.rowcount == 0:
+        # jeśli brak – wstaw
+        code = NAME2CODE.get(stage_name, "S?")
+        fields = {"percent": None, "to_finish": "", "notes": "", "finished": "-",
+                  "last_updated": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                  "photos": "", "last_editor": editor_name or "", "last_editor_id": str(editor_id or "")}
         for k, v in updates.items():
-            ws.cell(target_row, hidx[k], v)
-        ws.cell(target_row, hidx["LastUpdated"], datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
-        ws.cell(target_row, hidx["LastEditor"], editor_name)
-        ws.cell(target_row, hidx["LastEditorId"], str(editor_id))
-        _atomic_save_wb(wb, EXCEL_FILE)
-    _with_lock(_upd)
+            fields[colmap[k]] = v
+        cur.execute("""
+            INSERT INTO stages(project_id, code, name, percent, to_finish, notes, finished, last_updated, photos, last_editor, last_editor_id)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?);
+        """, (pid, code, stage_name, fields["percent"], fields["to_finish"], fields["notes"], fields["finished"],
+              fields["last_updated"], fields["photos"], fields["last_editor"], fields["last_editor_id"]))
+    conn.commit(); conn.close()
+
+def _percent_preview_for_project(project: str) -> str:
+    pid = _get_project_id(project)
+    if not pid:
+        return "-"
+    conn = _conn(); cur = conn.cursor()
+    cur.execute("SELECT code, name, percent FROM stages WHERE project_id=?;", (pid,))
+    rows = {r["name"]: ( "-" if r["percent"] is None else (f"{int(r['percent'])}%" if str(r["percent"]).isdigit() else str(r["percent"])) ) for r in cur.fetchall()}
+    conn.close()
+    parts = []
+    for st in STAGES:
+        parts.append(f"{st['name'].split()[-1]} {rows.get(st['name'], '-')}")
+    return " | ".join(parts)
 
 # ──────────────────── UI helpers ────────────────────
 async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
@@ -260,7 +298,7 @@ async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
         pass
 
 async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
-    """Edytuje istniejący panel; jeśli identyczny – nic nie robi; nową wiadomość wysyła tylko gdy naprawdę musi."""
+    """Edytuje istniejący panel; nową wiadomość wysyła tylko jeśli edycja jest niemożliwa."""
     chat = update_or_ctx.effective_chat if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.message.chat
     chat_id = chat.id
     sticky_id = context.user_data.get("sticky_id")
@@ -275,30 +313,24 @@ async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: st
             msg = str(e).lower()
             if "message is not modified" in msg:
                 return
-            # jeśli edycja niemożliwa → wyślij nową
             if not any(s in msg for s in [
                 "message to edit not found",
                 "message identifier is not specified",
                 "chat not found",
                 "message can't be edited",
             ]):
+                # inny błąd – nie próbuj wysyłać nowego
                 return
         except Exception:
             return
-    # brak sticky_id lub nie da się edytować — wyślij nowy panel i zapisz id trwale
     m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
     context.user_data["sticky_id"] = m.message_id
-    uid = update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.from_user.id
-    # dopisz sticky_id do pliku stanu
-    state = load_user_state(uid) or {}
-    state.update({
-        "sticky_id": m.message_id,
-        "date": context.user_data.get("date"),
-        "project": context.user_data.get("project"),
-        "stage_code": context.user_data.get("stage_code"),
-        "await": context.user_data.get("await"),
-    })
-    save_user_state(uid, state)
+    try:
+        uid = (update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update)
+               else update_or_ctx.callback_query.from_user.id)
+        sync_out(uid, context)
+    except Exception:
+        pass
 
 def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
     aw = context.user_data.get("await") or {}
@@ -332,22 +364,6 @@ def projects_menu_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup
     rows.append([InlineKeyboardButton(mark("➕ Dodaj inwestycję", adding), callback_data="proj:add")])
     rows.append([InlineKeyboardButton("🗄 Archiwum", callback_data="proj:arch")])
     return InlineKeyboardMarkup(rows)
-
-def _percent_preview_for_project(project: str) -> str:
-    try:
-        ws = ensure_project_sheet(project)
-        headers = [c.value for c in ws[1]]; hidx = {h: i+1 for i, h in enumerate(headers)}
-        vals = {}
-        for r in range(2, ws.max_row + 1):
-            st = ws.cell(r, hidx["Stage"]).value
-            p = ws.cell(r, hidx["Percent"]).value
-            vals[st] = "-" if (p in ("", None)) else f"{int(p)}%" if str(p).isdigit() else str(p)
-        parts = []
-        for st in STAGES:
-            parts.append(f"{st['name'].split()[-1]} {vals.get(st['name'], '-')}")
-        return " | ".join(parts)
-    except Exception:
-        return "-"
 
 def project_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     proj = context.user_data.get("project")
@@ -415,7 +431,7 @@ def stage_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(mark("🔧 Do dokończenia", "todo"), callback_data="stage:set:todo"),
          InlineKeyboardButton(mark("📝 Notatki", "notes"), callback_data="stage:set:notes")],
         [InlineKeyboardButton(mark("📊 % (0/25/50/75/90/100)", "percent"), callback_data=f"stage:set:percent:{scode}"),
-         InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
+        InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
         [InlineKeyboardButton("🧹 Wyczyść Do dokończenia", callback_data=f"stage:clear:todo:{scode}"),
          InlineKeyboardButton("🧹 Wyczyść Notatki", callback_data=f"stage:clear:notes:{scode}")],
         [InlineKeyboardButton("💾 Zapisz zmiany", callback_data=f"stage:save:{scode}")],
@@ -474,7 +490,11 @@ async def render_stage(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────── Handlers ────────────────────
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = sync_in(update, context)
+    # NIE czyścimy sticky_id
+    sticky_id = context.user_data.get("sticky_id")
     context.user_data.clear()
+    if sticky_id:
+        context.user_data["sticky_id"] = sticky_id
     context.user_data["date"] = today_str()
     sync_out(uid, context)
     await render_home(update, context)
@@ -484,9 +504,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 *Pomoc – Inwestycje*\n"
         "• /start – lista inwestycji, dodawanie, archiwum.\n"
-        "• W projekcie → Etap → edycja pól. Zmiany zapisują się do Excela i natychmiast widać w panelu.\n"
+        "• W projekcie → Etap → edytuj pola. Zmiany zapisują się do *SQLite* i od razu widać je w panelu.\n"
         "• Kropki ○/● pokazują, że czekam na tekst/zdjęcie.\n"
-        "• Stan sesji jest trwały (działa stabilnie na webhooku/skalowaniu).\n"
+        "• Stan sesji (w tym sticky_id) jest trwały.\n"
     )
     await sticky_set(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")]]))
 
@@ -535,6 +555,7 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("arch:tog:"):
         idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
         if 0 <= idx < len(names):
+            # toggle active
             allp = {p["name"]: p for p in list_projects(active_only=False)}
             cur = allp.get(names[idx])
             if cur: set_project_active(names[idx], not cur["active"])
@@ -721,6 +742,7 @@ async def on_startup(app: Application) -> None:
     ])
 
 def build_app() -> Application:
+    init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -749,8 +771,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
     if not TELEGRAM_TOKEN:
         raise SystemExit("Brak TELEGRAM_TOKEN w env.")
-    app = build_app()
+    bot_app = build_app()
     if WEBHOOK_URL:
-        app.run_webhook(listen="0.0.0.0", port=PORT, url_path=TELEGRAM_TOKEN, webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+        bot_app.run_webhook(listen="0.0.0.0", port=PORT, url_path=TELEGRAM_TOKEN, webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
     else:
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
