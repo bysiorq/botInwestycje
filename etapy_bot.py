@@ -1,4 +1,4 @@
-# ────────────────────────── etapy_bot.py (2025-08 • SQLite + solidny sticky panel + USUWANIE) ──────────────────────────
+# ────────────────────────── etapy_bot.py (2025-08 • SQLite + solidny sticky panel) ──────────────────────────
 import os
 import re
 import json
@@ -184,12 +184,6 @@ def set_project_finished(name: str, finished: bool) -> None:
     cur.execute("UPDATE projects SET finished=? WHERE name=?;", (1 if finished else 0, name))
     conn.commit(); conn.close()
 
-def delete_project(name: str) -> None:
-    """Kasuje projekt i wszystkie jego etapy."""
-    conn = _conn(); cur = conn.cursor()
-    cur.execute("DELETE FROM projects WHERE name=?;", (name,))
-    conn.commit(); conn.close()
-
 def read_stage(project: str, stage_name: str) -> Dict[str, str]:
     pid = _get_project_id(project)
     if not pid:
@@ -294,6 +288,7 @@ async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: st
             logging.info(f"editMessageText failed: {emsg}")
             if "message is not modified" in emsg.lower():
                 return
+            # na każdy inny BadRequest – spróbuj wysłać nową
             can_send_new = True
         except Exception as e:
             logging.info(f"editMessageText exception: {e}")
@@ -354,7 +349,6 @@ def project_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         if tf:
             prev = tf if len(tf) <= 60 else tf[:57] + "…"
             out.append(f"• {st['name']}{ptxt}: 🔧 {prev}")
-    out.append("\n⚠️ Usunięcie inwestycji jest nieodwracalne.")
     return "\n".join(out)
 
 def project_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
@@ -368,7 +362,6 @@ def project_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup
         [InlineKeyboardButton("Prace dodatkowe", callback_data="stage:open:S7")],
         [InlineKeyboardButton("✅ Oznacz zakończoną", callback_data="proj:finish"),
          InlineKeyboardButton("📦 Archiwizuj/Przywróć", callback_data="proj:toggle_active")],
-        [InlineKeyboardButton("🗑 Usuń inwestycję", callback_data="proj:delete")],
         [InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -508,10 +501,7 @@ def _render_archive_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMark
     rows = []
     for i, p in enumerate(projs):
         state = "🟢" if p["active"] else "⚪️"
-        rows.append([
-            InlineKeyboardButton(f"{state} {p['name']}", callback_data=f"arch:tog:{i}"),
-            InlineKeyboardButton("🗑", callback_data=f"arch:del:{i}")
-        ])
+        rows.append([InlineKeyboardButton(f"{state} {p['name']}", callback_data=f"arch:tog:{i}")])
     rows.append([InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -526,7 +516,7 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_home(update, context); return
 
     if data == "proj:arch":
-        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij, aby przełączyć lub usuń 🗑):", _render_archive_kb(context)); sync_out(uid, context); return
+        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
 
     if data.startswith("arch:tog:"):
         idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
@@ -534,32 +524,7 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             allp = {p["name"]: p for p in list_projects(active_only=False)}
             cur = allp.get(names[idx])
             if cur: set_project_active(names[idx], not cur["active"])
-        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij, aby przełączyć lub usuń 🗑):", _render_archive_kb(context)); sync_out(uid, context); return
-
-    if data.startswith("arch:del:"):
-        idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
-        name = names[idx] if 0 <= idx < len(names) else None
-        if not name:
-            await sticky_set(update, context, "❗️ Nie znaleziono pozycji archiwum.", _render_archive_kb(context)); sync_out(uid, context); return
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Usuń", callback_data=f"arch:delyes:{idx}"),
-             InlineKeyboardButton("Anuluj", callback_data="arch:delno")]
-        ])
-        await sticky_set(update, context, f"❗️ Potwierdź usunięcie inwestycji „{name}”. Tej operacji nie da się cofnąć.", kb); sync_out(uid, context); return
-
-    if data.startswith("arch:delyes:"):
-        idx = int(data.split(":")[2]); names = context.user_data.get("arch_names", [])
-        name = names[idx] if 0 <= idx < len(names) else None
-        if name:
-            delete_project(name)
-            # jeżeli usunięto aktualnie otwarty projekt – wyczyść kontekst
-            if context.user_data.get("project") == name:
-                for k in ("project", "stage_code", "await"):
-                    context.user_data.pop(k, None)
-        await sticky_set(update, context, "✅ Usunięto. Wybierz kolejne:", _render_archive_kb(context)); sync_out(uid, context); return
-
-    if data == "arch:delno":
-        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij, aby przełączyć lub usuń 🗑):", _render_archive_kb(context)); sync_out(uid, context); return
+        await sticky_set(update, context, "🗄 Archiwum / Aktywne (kliknij aby przełączyć):", _render_archive_kb(context)); sync_out(uid, context); return
 
     if data.startswith("proj:open:"):
         idx = int(data.split(":")[2]); projs = list_projects(active_only=True)
@@ -584,27 +549,6 @@ async def projects_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = allp.get(proj)
             if cur: set_project_active(proj, not cur["active"])
         sync_out(uid, context); await render_home(update, context); return
-
-    if data == "proj:delete":
-        proj = context.user_data.get("project")
-        if not proj:
-            await render_home(update, context); return
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Usuń", callback_data="proj:delyes"),
-             InlineKeyboardButton("Anuluj", callback_data="proj:delno")]
-        ])
-        await sticky_set(update, context, f"❗️ Potwierdź usunięcie inwestycji „{proj}”. Tej operacji nie da się cofnąć.", kb); sync_out(uid, context); return
-
-    if data == "proj:delyes":
-        name = context.user_data.get("project")
-        if name:
-            delete_project(name)
-            for k in ("project", "stage_code", "await"):
-                context.user_data.pop(k, None)
-        await sticky_set(update, context, "✅ Inwestycję usunięto.", projects_menu_kb(context)); sync_out(uid, context); await render_home(update, context); return
-
-    if data == "proj:delno":
-        await render_project(update, context); sync_out(uid, context); return
 
 # --- panel etapu ---
 async def stage_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -773,11 +717,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(date_open_cb, pattern=r"^date:open$"))
     app.add_handler(CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$"))
 
-    # projekty / archiwum / usuwanie
-    app.add_handler(CallbackQueryHandler(
-        projects_router,
-        pattern=r"^(nav:home|proj:add|proj:arch|arch:tog:\d+|arch:del:\d+|arch:delyes:\d+|arch:delno|proj:open:\d+|proj:finish|proj:toggle_active|proj:delete|proj:delyes|proj:delno)$"
-    ))
+    # projekty / archiwum
+    app.add_handler(CallbackQueryHandler(projects_router, pattern=r"^(nav:home|proj:add|proj:arch|arch:tog:\d+|proj:open:\d+|proj:finish|proj:toggle_active)$"))
 
     # panel etapu + procenty
     app.add_handler(CallbackQueryHandler(stage_router, pattern=r"^(stage:open:S[1-7]|stage:set:(todo|notes)|stage:set:percent:S[1-7]|stage:clear:(todo|notes):S[1-7]|stage:save:S[1-7]|proj:back|stage:add_photo)$"))
