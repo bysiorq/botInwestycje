@@ -1,8 +1,8 @@
-# ────────────────────────── etapy_bot.py (2025-08 • FIX: brak duplikatów panelu + stabilne % i zapisy) ──────────────────────────
-# Single-message UI jak BotFather. Stabilne na webhooku/wielu replikach:
-# - Stan per user w /data/state/<uid>.json (project, stage_code, await, date)
+# ────────────────────────── etapy_bot.py (2025-08 • FIX v2: sticky_id sync + pct regex + stabilne renderowanie) ──────────────────────────
+# Single-message UI jak BotFather. Stabilne na webhooku / wielu replikach:
+# - Stan per user w /data/state/<uid>.json (date, project, stage_code, await, sticky_id)
 # - Callbacki niosą stage_code (S1..S7) → brak zależności od ulotnego user_data
-# - Każda zmiana zapisuje do Excela i renderuje widok; jeśli treść się nie zmieni, NIE tworzymy nowej wiadomości
+# - Każda zmiana zapisuje do Excela i renderuje widok; nie duplikujemy panelu
 # - Nazwy arkuszy Excela sanityzowane (max 31, bez : \ / ? * [ ])
 
 import os
@@ -112,7 +112,8 @@ def sync_in(update_or_ctx, context: ContextTypes.DEFAULT_TYPE) -> int:
            else update_or_ctx.callback_query.from_user.id)
     state = load_user_state(uid)
     if state:
-        for k in ["date", "project", "stage_code", "await"]:
+        # ⬇⬇⬇ WAŻNE: załaduj też sticky_id
+        for k in ["date", "project", "stage_code", "await", "sticky_id"]:
             if k in state:
                 context.user_data[k] = state[k]
     return uid
@@ -242,7 +243,6 @@ def update_stage(project: str, stage_name: str, updates: Dict[str, str], editor_
             target_row = ws.max_row + 1; ws.append([stage_name] + [""]*(len(headers)-1))
         for k, v in updates.items():
             ws.cell(target_row, hidx[k], v)
-        # Dodaj sekundy, by łatwiej różnicować treść panelu
         ws.cell(target_row, hidx["LastUpdated"], datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
         ws.cell(target_row, hidx["LastEditor"], editor_name)
         ws.cell(target_row, hidx["LastEditorId"], str(editor_id))
@@ -260,8 +260,7 @@ async def safe_answer(q, text: Optional[str] = None, show_alert: bool = False):
         pass
 
 async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
-    """Edytuje istniejący panel; jeśli identyczny – NIC nie robi; nową wiadomość wysyła tylko gdy nie ma sticky_id albo
-    gdy edycja jest niemożliwa (np. 'message to edit not found')."""
+    """Edytuje istniejący panel; jeśli identyczny – nic nie robi; nową wiadomość wysyła tylko gdy naprawdę musi."""
     chat = update_or_ctx.effective_chat if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.message.chat
     chat_id = chat.id
     sticky_id = context.user_data.get("sticky_id")
@@ -274,29 +273,32 @@ async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: st
             return
         except BadRequest as e:
             msg = str(e).lower()
-            # NIE twórz nowej wiadomości, jeśli treść się nie zmieniła
             if "message is not modified" in msg:
                 return
-            # Jeśli edycja niemożliwa (skasowane itp.) – przejdź do wysłania nowej
+            # jeśli edycja niemożliwa → wyślij nową
             if not any(s in msg for s in [
                 "message to edit not found",
                 "message identifier is not specified",
                 "chat not found",
                 "message can't be edited",
             ]):
-                # Inne błędy – też nie duplikuj panelu
                 return
         except Exception:
-            # Nie duplikuj przy nieznanym błędzie
             return
-    # Brak sticky_id albo poprzednia wiadomość nie istnieje → wyślij nową i zapamiętaj id
+    # brak sticky_id lub nie da się edytować — wyślij nowy panel i zapisz id trwale
     m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
     context.user_data["sticky_id"] = m.message_id
-    # zapisz sticky_id trwale (przydatne przy replikach)
     uid = update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update) else update_or_ctx.callback_query.from_user.id
-    save_user_state(uid, {**load_user_state(uid), "sticky_id": m.message_id, "date": context.user_data.get("date"),
-                          "project": context.user_data.get("project"), "stage_code": context.user_data.get("stage_code"),
-                          "await": context.user_data.get("await")})
+    # dopisz sticky_id do pliku stanu
+    state = load_user_state(uid) or {}
+    state.update({
+        "sticky_id": m.message_id,
+        "date": context.user_data.get("date"),
+        "project": context.user_data.get("project"),
+        "stage_code": context.user_data.get("stage_code"),
+        "await": context.user_data.get("await"),
+    })
+    save_user_state(uid, state)
 
 def banner_await(context: ContextTypes.DEFAULT_TYPE) -> str:
     aw = context.user_data.get("await") or {}
@@ -413,7 +415,7 @@ def stage_panel_kb(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(mark("🔧 Do dokończenia", "todo"), callback_data="stage:set:todo"),
          InlineKeyboardButton(mark("📝 Notatki", "notes"), callback_data="stage:set:notes")],
         [InlineKeyboardButton(mark("📊 % (0/25/50/75/90/100)", "percent"), callback_data=f"stage:set:percent:{scode}"),
-            InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
+         InlineKeyboardButton(mark("📸 Dodaj zdjęcie", "photo"), callback_data="stage:add_photo")],
         [InlineKeyboardButton("🧹 Wyczyść Do dokończenia", callback_data=f"stage:clear:todo:{scode}"),
          InlineKeyboardButton("🧹 Wyczyść Notatki", callback_data=f"stage:clear:notes:{scode}")],
         [InlineKeyboardButton("💾 Zapisz zmiany", callback_data=f"stage:save:{scode}")],
@@ -724,14 +726,18 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
 
+    # data
     app.add_handler(CallbackQueryHandler(date_open_cb, pattern=r"^date:open$"))
     app.add_handler(CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$"))
 
+    # projekty / archiwum
     app.add_handler(CallbackQueryHandler(projects_router, pattern=r"^(nav:home|proj:add|proj:arch|arch:tog:\d+|proj:open:\d+|proj:finish|proj:toggle_active)$"))
 
+    # panel etapu + procenty
     app.add_handler(CallbackQueryHandler(stage_router, pattern=r"^(stage:open:S[1-7]|stage:set:(todo|notes)|stage:set:percent:S[1-7]|stage:clear:(todo|notes):S[1-7]|stage:save:S[1-7]|proj:back|stage:add_photo)$"))
     app.add_handler(CallbackQueryHandler(percent_cb, pattern=r"^(pct:(S[1-7]):(\d+|manual)|pct:back)$"))
 
+    # wejścia
     app.add_handler(MessageHandler(filters.PHOTO, photo_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
 
